@@ -19,10 +19,33 @@ from .report import generate_report
 from .sweep import sweep_cost
 
 
+def _str2bool(value: str | bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "y", "on"}:
+        return True
+    if text in {"0", "false", "no", "n", "off"}:
+        return False
+    raise argparse.ArgumentTypeError(f"invalid bool: {value}")
+
+
 def _add_config_args(parser: argparse.ArgumentParser) -> None:
     for field in fields(Config):
         name = field.name.replace("_", "-")
         if field.type is bool:
+            if field.name == "offline":
+                group = parser.add_mutually_exclusive_group()
+                group.add_argument(
+                    f"--{name}",
+                    dest=field.name,
+                    nargs="?",
+                    const=True,
+                    default=False,
+                    type=_str2bool,
+                )
+                group.add_argument(f"--no-{name}", dest=field.name, action="store_false")
+                continue
             group = parser.add_mutually_exclusive_group()
             group.add_argument(f"--{name}", dest=field.name, action="store_true")
             group.add_argument(f"--no-{name}", dest=field.name, action="store_false")
