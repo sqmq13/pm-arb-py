@@ -43,3 +43,6 @@ def test_fetch_markets_pagination(monkeypatch):
     assert [call["offset"] for call in calls] == [0, 100, 200]
     assert all(call["limit"] == 100 for call in calls)
     assert all(call["closed"] == "false" for call in calls)
+    assert all(call["active"] == "true" for call in calls)
+    assert all(call["order"] == "id" for call in calls)
+    assert all(call["ascending"] == "false" for call in calls)

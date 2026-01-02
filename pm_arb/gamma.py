@@ -30,13 +30,26 @@ def parse_clob_token_ids(value: Any) -> list[str]:
 
 
 def fetch_markets(
-    base_url: str, timeout: float, limit: int = 100, max_markets: int | None = None
+    base_url: str,
+    timeout: float,
+    limit: int = 100,
+    max_markets: int | None = None,
+    params_override: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     url = f"{base_url.rstrip('/')}/markets"
     offset = 0
     markets: list[dict[str, Any]] = []
     while True:
-        params = {"closed": "false", "limit": limit, "offset": offset}
+        params = {
+            "closed": "false",
+            "active": "true",
+            "order": "id",
+            "ascending": "false",
+            "limit": limit,
+            "offset": offset,
+        }
+        if params_override:
+            params.update(params_override)
         resp = requests.get(url, params=params, timeout=timeout)
         resp.raise_for_status()
         data = resp.json()
