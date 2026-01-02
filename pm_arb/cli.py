@@ -19,6 +19,14 @@ from .report import generate_report
 from .sweep import sweep_cost
 
 
+def _is_field_type(field_type, expected: type, expected_name: str) -> bool:
+    if field_type is expected:
+        return True
+    if isinstance(field_type, str) and field_type == expected_name:
+        return True
+    return False
+
+
 def _str2bool(value: str | bool) -> bool:
     if isinstance(value, bool):
         return value
@@ -33,7 +41,7 @@ def _str2bool(value: str | bool) -> bool:
 def _add_config_args(parser: argparse.ArgumentParser) -> None:
     for field in fields(Config):
         name = field.name.replace("_", "-")
-        if field.type is bool:
+        if _is_field_type(field.type, bool, "bool"):
             if field.name == "offline":
                 group = parser.add_mutually_exclusive_group()
                 group.add_argument(
@@ -60,11 +68,11 @@ def _cli_overrides(ns: argparse.Namespace) -> dict[str, Any]:
         value = getattr(ns, field.name, None)
         if value is None:
             continue
-        if field.type is bool:
-            overrides[field.name] = bool(value)
-        elif field.type is int:
+        if _is_field_type(field.type, bool, "bool"):
+            overrides[field.name] = _str2bool(value)
+        elif _is_field_type(field.type, int, "int"):
             overrides[field.name] = int(value)
-        elif field.type is float:
+        elif _is_field_type(field.type, float, "float"):
             overrides[field.name] = float(value)
         else:
             overrides[field.name] = value
