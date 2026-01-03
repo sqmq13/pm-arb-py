@@ -37,42 +37,49 @@ def fetch_markets(
     limit: int = 100,
     max_markets: int | None = None,
     params_override: dict[str, Any] | None = None,
+    session: requests.Session | None = None,
 ) -> list[dict[str, Any]]:
     url = f"{base_url.rstrip('/')}/markets"
     offset = 0
     markets: list[dict[str, Any]] = []
-    while True:
-        params = {
-            "closed": "false",
-            "active": "true",
-            "order": "id",
-            "ascending": "false",
-            "limit": limit,
-            "offset": offset,
-        }
-        if params_override:
-            params.update(params_override)
-        resp = requests.get(
-            url,
-            params=params,
-            timeout=timeout,
-            headers={"User-Agent": DEFAULT_USER_AGENT},
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        if isinstance(data, dict) and "markets" in data:
-            page = list(data["markets"])
-        elif isinstance(data, list):
-            page = data
-        else:
-            raise ValueError("unexpected Gamma response shape")
-        if not page:
-            break
-        markets.extend(page)
-        if max_markets is not None and len(markets) >= max_markets:
-            return markets[:max_markets]
-        offset += limit
-    return markets
+    created_session = False
+    if session is None:
+        session = requests.Session()
+        created_session = True
+    try:
+        while True:
+            params = {
+                "order": "id",
+                "ascending": "false",
+                "limit": limit,
+                "offset": offset,
+            }
+            if params_override:
+                params.update(params_override)
+            resp = session.get(
+                url,
+                params=params,
+                timeout=timeout,
+                headers={"User-Agent": DEFAULT_USER_AGENT},
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            if isinstance(data, dict) and "markets" in data:
+                page = list(data["markets"])
+            elif isinstance(data, list):
+                page = data
+            else:
+                raise ValueError("unexpected Gamma response shape")
+            if not page:
+                break
+            markets.extend(page)
+            if max_markets is not None and len(markets) >= max_markets:
+                return markets[:max_markets]
+            offset += limit
+        return markets
+    finally:
+        if created_session:
+            session.close()
 
 
 def load_markets_fixture(path: str | Path) -> list[dict[str, Any]]:
