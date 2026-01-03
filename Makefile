@@ -8,7 +8,7 @@ setup:
 	$(UV) pip install -e .
 
 test:
-	$(UV) run pytest
+	$(UV) run python -m pytest
 
 run:
 	$(UV) run pm_arb scan
