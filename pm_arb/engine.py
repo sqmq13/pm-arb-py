@@ -23,6 +23,7 @@ from .sweep import sweep_cost
 from .ws_decode import decode_ws_raw
 
 SCHEMA_VERSION = 1
+ORJSON_OPTIONS = getattr(orjson, "OPT_ESCAPE_NON_ASCII", 0)
 
 
 @dataclass
@@ -101,7 +102,7 @@ class EventLogger:
             raise RuntimeError(f"low disk: {free_gb:.2f} GB free")
 
     def write(self, record: dict[str, Any], skip_disk_check: bool = False) -> None:
-        payload = orjson.dumps(record, option=orjson.OPT_ESCAPE_NON_ASCII)
+        payload = orjson.dumps(record, option=ORJSON_OPTIONS)
         if not skip_disk_check:
             self._check_disk()
         self._rotate_if_needed(len(payload) + 1)
@@ -631,7 +632,7 @@ class Engine:
     def _capture_ws_sample(self, raw: dict[str, Any], capture_path: Path, count: int) -> None:
         capture_path.parent.mkdir(parents=True, exist_ok=True)
         with capture_path.open("ab") as handle:
-            handle.write(orjson.dumps(raw, option=orjson.OPT_ESCAPE_NON_ASCII) + b"\n")
+            handle.write(orjson.dumps(raw, option=ORJSON_OPTIONS) + b"\n")
 
     def scan_offline(self) -> int:
         markets = self._load_markets()
@@ -823,9 +824,7 @@ class Engine:
                         dump_path.parent.mkdir(parents=True, exist_ok=True)
                         candidates = self._discover_candidates(markets)[:20]
                         with dump_path.open("ab") as handle:
-                            handle.write(
-                                orjson.dumps(candidates, option=orjson.OPT_ESCAPE_NON_ASCII) + b"\n"
-                            )
+                            handle.write(orjson.dumps(candidates, option=ORJSON_OPTIONS) + b"\n")
                         self._record("coverage_dump", now_ns, count=len(candidates))
                         self._alarm(now_ns, "coverage_low", "selected markets below threshold")
                         self._end_all_windows(now_ns, "coverage_low_taint")
