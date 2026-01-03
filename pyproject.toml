@@ -12,12 +12,6 @@ dependencies = [
   "websocket-client>=1.7.0",
 ]
 
-[project.optional-dependencies]
-dev = [
-  "pytest>=8.0.0",
-  "pytest-asyncio>=0.23.6",
-]
-
 [project.scripts]
 pm_arb = "pm_arb.cli:main"
 
@@ -27,3 +21,9 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
 packages = ["pm_arb"]
+
+[dependency-groups]
+dev = [
+  "pytest>=8.0.0",
+  "pytest-asyncio>=0.23.6",
+]
