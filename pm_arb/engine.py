@@ -121,8 +121,10 @@ class Engine:
             min_free_disk_gb=config.min_free_disk_gb,
         )
         self.tainted = False
+        self.ws_connected = False
         self.ws_disconnected = False
         self.ws_disconnect_alarm_sent = False
+        self._ws_disconnect_start_ns: int | None = None
         self.parse_failures = 0
         self.parse_total = 0
         self.coverage_low_polls = 0
@@ -132,8 +134,7 @@ class Engine:
         self.ws_empty_arrays = 0
         self.ws_book_like = 0
         self.ws_json_errors = 0
-        self.last_ws_nonpong_ns: int | None = None
-        self.last_ws_book_ns: int | None = None
+        self.last_ws_rx_ns: int | None = None
         self._book_ok_cache: dict[str, bool] = {}
         self.market_states: dict[str, MarketState] = {}
         self.token_states: dict[str, TokenState] = {}
@@ -457,7 +458,7 @@ class Engine:
                 self._end_market_windows(market, now_ns, "token_no_feed")
             if token_a.rest_unavailable or token_b.rest_unavailable:
                 self._end_market_windows(market, now_ns, "reconcile_failed")
-        if self.ws_disconnected:
+        if self.ws_disconnect_alarm_sent:
             self._end_all_windows(now_ns, "ws_disconnected")
 
     def _check_no_feed(self, now_ns: int) -> None:
@@ -471,18 +472,18 @@ class Engine:
                 if now_ns - token.subscription_ns > threshold_ns:
                     token.no_feed = True
                     self._alarm(now_ns, "no_feed", "no decodable book in 30s", token_id=token.token_id)
-            else:
-                if now_ns - token.last_book_ns > threshold_ns:
-                    token.no_feed = True
-                    self._alarm(now_ns, "no_feed", "no decodable book in 30s", token_id=token.token_id)
 
     def _maybe_heartbeat(self, now_ns: int, next_heartbeat_ns: int) -> int:
         if now_ns < next_heartbeat_ns:
             return next_heartbeat_ns
+        ws_idle_ms = None
+        if self.last_ws_rx_ns is not None:
+            ws_idle_ms = (now_ns - self.last_ws_rx_ns) / 1_000_000
         self._record(
             "heartbeat",
             now_ns,
             ws_disconnected=self.ws_disconnected,
+            ws_idle_ms=ws_idle_ms,
             tokens=len(self.token_states),
             markets=len(self.market_states),
             ws_total_messages=self.ws_total_messages,
@@ -698,11 +699,15 @@ class Engine:
                 import websockets
 
                 async with websockets.connect(url) as ws:
+                    self.ws_connected = True
+                    if self.last_ws_rx_ns is None:
+                        self.last_ws_rx_ns = time.monotonic_ns()
                     await ws.send(json.dumps(payload))
                     while True:
                         raw = await ws.recv()
                         await queue.put(raw)
             except Exception:
+                self.ws_connected = False
                 await asyncio.sleep(1.0)
 
     async def _scan_online_async(self) -> None:
@@ -711,7 +716,7 @@ class Engine:
         if not self.config.offline:
             selected = self._filter_markets_by_book(selected)
         now_ns = time.monotonic_ns()
-        self.last_ws_nonpong_ns = now_ns
+        self.last_ws_rx_ns = now_ns
         self.start_ns = now_ns
         self._init_states(selected, now_ns)
         self._geoblock_check(now_ns)
@@ -739,11 +744,11 @@ class Engine:
                     raw = await asyncio.wait_for(queue.get(), timeout=0.25)
                     # WS payloads are often list-of-events, plus "PONG" and empty [] keepalives.
                     self.ws_total_messages += 1
+                    self.last_ws_rx_ns = now_ns
                     decoded = decode_ws_raw(raw)
                     if decoded.is_pong:
                         self.ws_pongs += 1
                     else:
-                        self.last_ws_nonpong_ns = now_ns
                         if decoded.json_error:
                             self.ws_json_errors += 1
                         else:
@@ -751,7 +756,6 @@ class Engine:
                                 self.ws_empty_arrays += 1
                             if decoded.book_items:
                                 self.ws_book_like += len(decoded.book_items)
-                                self.last_ws_book_ns = now_ns
                                 for item in decoded.book_items:
                                     if capture_count < self.config.ws_sample_capture_n:
                                         self._capture_ws_sample(item, capture_path, capture_count)
@@ -789,18 +793,20 @@ class Engine:
                         coverage_low_polls=self.coverage_low_polls,
                     )
                     next_poll = now_ns + int(self.config.markets_poll_interval * 1_000_000_000)
-                if self.last_ws_nonpong_ns is not None:
-                    if now_ns - self.last_ws_nonpong_ns > int(
+                self.ws_disconnected = not self.ws_connected
+                if self.ws_connected:
+                    self._ws_disconnect_start_ns = None
+                    self.ws_disconnect_alarm_sent = False
+                else:
+                    if self._ws_disconnect_start_ns is None:
+                        self._ws_disconnect_start_ns = now_ns
+                    if now_ns - self._ws_disconnect_start_ns > int(
                         self.config.ws_disconnect_alarm_seconds * 1_000_000_000
                     ):
                         if not self.ws_disconnect_alarm_sent:
-                            self.ws_disconnected = True
-                            self._alarm(now_ns, "ws_disconnected", "no ws messages")
+                            self._alarm(now_ns, "ws_disconnected", "ws socket disconnected")
                             self._end_all_windows(now_ns, "ws_disconnected")
                             self.ws_disconnect_alarm_sent = True
-                    elif self.ws_disconnected:
-                        self.ws_disconnected = False
-                        self.ws_disconnect_alarm_sent = False
                 self._check_integrity(now_ns)
                 self._apply_status_endings(now_ns)
                 self._check_no_feed(now_ns)
