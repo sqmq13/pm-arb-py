@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-import json
+import orjson
 from typing import Any, Callable
 
 import websockets
@@ -31,10 +31,12 @@ async def _read_until_decodable(
             raise TimeoutError("timeout waiting for book after handshake")
         raw = await asyncio.wait_for(ws.recv(), timeout=remaining)
         if isinstance(raw, bytes):
-            raw = raw.decode("utf-8", errors="ignore")
+            raw_payload: str | bytes = raw
+        else:
+            raw_payload = str(raw)
         try:
-            msg = json.loads(raw)
-        except json.JSONDecodeError:
+            msg = orjson.loads(raw_payload)
+        except orjson.JSONDecodeError:
             continue
         try:
             decode_fn(msg)
@@ -50,7 +52,7 @@ async def _try_payload(
     decode_fn: Callable[[Any], Any],
 ) -> Any:
     async with websockets.connect(url) as ws:
-        await ws.send(json.dumps(payload))
+        await ws.send(orjson.dumps(payload).decode("utf-8"))
         return await _read_until_decodable(ws, timeout, decode_fn)
 
 

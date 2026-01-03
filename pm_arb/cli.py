@@ -8,6 +8,13 @@ from dataclasses import fields
 from pathlib import Path
 from typing import Any
 
+try:
+    import uvloop
+
+    asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+except ImportError:
+    pass
+
 from .book import BookParseError, OrderBook, parse_ws_message
 from .clob_rest import RestClient, fetch_book_with_retries
 from .clob_ws import wait_for_decodable_book

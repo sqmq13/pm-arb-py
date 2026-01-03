@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import json
+import orjson
 import random
 import re
 import shutil
@@ -101,12 +101,12 @@ class EventLogger:
             raise RuntimeError(f"low disk: {free_gb:.2f} GB free")
 
     def write(self, record: dict[str, Any], skip_disk_check: bool = False) -> None:
-        payload = json.dumps(record, separators=(",", ":"), ensure_ascii=True)
+        payload = orjson.dumps(record, option=orjson.OPT_ESCAPE_NON_ASCII)
         if not skip_disk_check:
             self._check_disk()
         self._rotate_if_needed(len(payload) + 1)
-        with self.log_path.open("a", encoding="utf-8") as handle:
-            handle.write(payload + "\n")
+        with self.log_path.open("ab") as handle:
+            handle.write(payload + b"\n")
 
 
 class Engine:
@@ -135,9 +135,11 @@ class Engine:
         self.ws_empty_arrays = 0
         self.ws_book_like = 0
         self.ws_json_errors = 0
+        self.ws_last_json_error_sample: str | None = None
         self.last_ws_rx_ns: int | None = None
         self._book_ok_cache: dict[str, bool] = {}
         self.market_states: dict[str, MarketState] = {}
+        self._token_to_markets: dict[str, list[MarketState]] = {}
         self.token_states: dict[str, TokenState] = {}
         self.reconciler = Reconciler(
             persist_n=config.reconcile_mismatch_persist_n,
@@ -305,16 +307,18 @@ class Engine:
             if len(token_ids) != 2:
                 continue
             token_a, token_b = str(token_ids[0]), str(token_ids[1])
-            self.market_states[market.get("id", token_a + ":" + token_b)] = MarketState(
+            market_state = MarketState(
                 market_id=market.get("id", token_a + ":" + token_b),
                 token_a=token_a,
                 token_b=token_b,
             )
+            self.market_states[market.get("id", token_a + ":" + token_b)] = market_state
             for token_id in (token_a, token_b):
                 if token_id not in self.token_states:
                     state = TokenState(token_id=token_id, book=OrderBook(token_id=token_id))
                     state.subscription_ns = now_ns
                     self.token_states[token_id] = state
+                self._token_to_markets.setdefault(token_id, []).append(market_state)
 
     def _sizes(self) -> list[int]:
         if self._sizes_frozen and self._sizes_shares:
@@ -492,6 +496,7 @@ class Engine:
             ws_empty_arrays=self.ws_empty_arrays,
             ws_book_like=self.ws_book_like,
             ws_json_decode_errors=self.ws_json_errors,
+            ws_last_json_error_sample=self.ws_last_json_error_sample,
         )
         return now_ns + int(self.config.heartbeat_interval * 1_000_000_000)
 
@@ -550,11 +555,12 @@ class Engine:
                 self._alarm(now_ns, "reconcile_failed", str(exc), token_id=token_id)
         return now_ns + int(self.config.resync_interval * 1_000_000_000)
 
-    def _handle_ws_message(self, message: dict[str, Any], now_ns: int) -> None:
+    def _handle_ws_message(self, message: dict[str, Any], now_ns: int) -> set[str]:
         if isinstance(message, list):
+            token_ids: set[str] = set()
             for item in message:
-                self._handle_ws_message(item, now_ns)
-            return
+                token_ids.update(self._handle_ws_message(item, now_ns))
+            return token_ids
         self.parse_total += 1
         try:
             token_id, asks, ts = parse_ws_message(message, price_scale=self.config.price_scale)
@@ -564,27 +570,32 @@ class Engine:
             if self.parse_total <= 100 and fail_pct > self.config.ws_initial_parse_fail_threshold_pct:
                 self._alarm(now_ns, "parse_taint", "initial ws parse failures high")
                 self._end_all_windows(now_ns, "parse_taint")
-            return
+            return set()
         token_state = self.token_states.get(token_id)
         if not token_state:
-            return
+            return set()
         if ts is None:
             token_state.missing_ts += 1
         if ts is not None and token_state.last_msg_ts is not None and ts < token_state.last_msg_ts:
             token_state.ooo_drops += 1
-            return
+            return set()
         token_state.last_msg_ts = ts if ts is not None else token_state.last_msg_ts
         token_state.book.update_from_asks(asks, self.config.top_k)
         token_state.last_update_ns = now_ns
         token_state.last_book_ns = now_ns
         token_state.updates_count += 1
+        return {token_id}
 
-    def _evaluate_edges(self, now_ns: int) -> None:
+    def _evaluate_edges(self, now_ns: int, affected_token_id: str | None = None) -> None:
         sizes = self._sizes()
         if not sizes:
             return
         buffer_micro = self.config.buffer_per_share_micro()
-        for market in self.market_states.values():
+        if affected_token_id is None:
+            markets = self.market_states.values()
+        else:
+            markets = self._token_to_markets.get(affected_token_id, [])
+        for market in markets:
             token_a = self.token_states[market.token_a]
             token_b = self.token_states[market.token_b]
             if self.ws_disconnected or self.tainted:
@@ -619,8 +630,8 @@ class Engine:
 
     def _capture_ws_sample(self, raw: dict[str, Any], capture_path: Path, count: int) -> None:
         capture_path.parent.mkdir(parents=True, exist_ok=True)
-        with capture_path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(raw, separators=(",", ":"), ensure_ascii=True) + "\n")
+        with capture_path.open("ab") as handle:
+            handle.write(orjson.dumps(raw, option=orjson.OPT_ESCAPE_NON_ASCII) + b"\n")
 
     def scan_offline(self) -> int:
         markets = self._load_markets()
@@ -653,8 +664,7 @@ class Engine:
         messages: list[dict[str, Any]] = []
         for name in ws_files:
             path = self.fixtures_dir / name
-            with open(path, "r", encoding="utf-8") as handle:
-                messages.extend(json.load(handle))
+            messages.extend(orjson.loads(path.read_bytes()))
         next_heartbeat = 0
         next_reconcile = 0
         capture_path = Path(self.config.data_dir) / "debug" / "ws_samples.jsonl"
@@ -665,11 +675,12 @@ class Engine:
             if capture_count < self.config.ws_sample_capture_n:
                 self._capture_ws_sample(msg, capture_path, capture_count)
                 capture_count += 1
-            self._handle_ws_message(msg, now_ns)
+            affected_tokens = self._handle_ws_message(msg, now_ns)
             if self.config.sizes.strip().lower() == "auto":
                 self._collect_auto_sample()
                 self._maybe_freeze_sizes(now_ns, self.start_ns)
-            self._evaluate_edges(now_ns)
+            for token_id in affected_tokens:
+                self._evaluate_edges(now_ns, token_id)
             self._check_integrity(now_ns)
             self._apply_status_endings(now_ns)
             next_heartbeat = self._maybe_heartbeat(now_ns, next_heartbeat)
@@ -698,7 +709,7 @@ class Engine:
         try:
             while True:
                 await asyncio.sleep(interval_seconds)
-                await ws.send(json.dumps({"type": "ping"}))
+                await ws.send(orjson.dumps({"type": "ping"}).decode("utf-8"))
         except asyncio.CancelledError:
             return
 
@@ -711,7 +722,7 @@ class Engine:
                     self.ws_connected = True
                     if self.last_ws_rx_ns is None:
                         self.last_ws_rx_ns = time.monotonic_ns()
-                    await ws.send(json.dumps(payload))
+                    await ws.send(orjson.dumps(payload).decode("utf-8"))
                     heartbeat_task = asyncio.create_task(
                         self._ws_heartbeat(ws, self.config.ws_ping_interval_seconds)
                     )
@@ -774,11 +785,14 @@ class Engine:
                     self.ws_total_messages += 1
                     self.last_ws_rx_ns = now_ns
                     decoded = decode_ws_raw(raw)
+                    affected_tokens: set[str] = set()
                     if decoded.is_pong:
                         self.ws_pongs += 1
                     else:
                         if decoded.json_error:
                             self.ws_json_errors += 1
+                            if decoded.json_error_sample is not None:
+                                self.ws_last_json_error_sample = decoded.json_error_sample
                         else:
                             if decoded.empty_array:
                                 self.ws_empty_arrays += 1
@@ -788,11 +802,12 @@ class Engine:
                                     if capture_count < self.config.ws_sample_capture_n:
                                         self._capture_ws_sample(item, capture_path, capture_count)
                                         capture_count += 1
-                                    self._handle_ws_message(item, now_ns)
+                                    affected_tokens.update(self._handle_ws_message(item, now_ns))
                     if self.config.sizes.strip().lower() == "auto":
                         self._collect_auto_sample()
                         self._maybe_freeze_sizes(now_ns, self.start_ns)
-                    self._evaluate_edges(now_ns)
+                    for token_id in affected_tokens:
+                        self._evaluate_edges(now_ns, token_id)
                 except asyncio.TimeoutError:
                     pass
                 if now_ns >= next_poll:
@@ -807,9 +822,9 @@ class Engine:
                         dump_path = Path(self.config.data_dir) / "debug" / "coverage_dump.jsonl"
                         dump_path.parent.mkdir(parents=True, exist_ok=True)
                         candidates = self._discover_candidates(markets)[:20]
-                        with dump_path.open("a", encoding="utf-8") as handle:
+                        with dump_path.open("ab") as handle:
                             handle.write(
-                                json.dumps(candidates, separators=(",", ":"), ensure_ascii=True) + "\n"
+                                orjson.dumps(candidates, option=orjson.OPT_ESCAPE_NON_ASCII) + b"\n"
                             )
                         self._record("coverage_dump", now_ns, count=len(candidates))
                         self._alarm(now_ns, "coverage_low", "selected markets below threshold")

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import json
+import orjson
 from dataclasses import dataclass
 from typing import Any
 
@@ -13,6 +13,7 @@ class WsDecodeResult:
     json_error: bool
     empty_array: bool
     book_items: list[dict[str, Any]]
+    json_error_sample: str | None = None
 
 
 def _is_book_item(item: Any) -> bool:
@@ -25,8 +26,10 @@ def decode_ws_raw(raw: Any) -> WsDecodeResult:
     """Decode WS payloads which are often list-of-events, plus PONG/[] keepalives."""
     if isinstance(raw, bytes):
         raw_text = raw.decode("utf-8", errors="ignore")
+        raw_payload: str | bytes = raw
     else:
         raw_text = str(raw)
+        raw_payload = raw_text
     text = raw_text.strip()
     if text.upper() in {"PONG", "PING"}:
         return WsDecodeResult(
@@ -36,10 +39,11 @@ def decode_ws_raw(raw: Any) -> WsDecodeResult:
             json_error=False,
             empty_array=False,
             book_items=[],
+            json_error_sample=None,
         )
     try:
-        payload = json.loads(raw_text)
-    except json.JSONDecodeError:
+        payload = orjson.loads(raw_payload)
+    except orjson.JSONDecodeError:
         return WsDecodeResult(
             raw_text=raw_text,
             payload=None,
@@ -47,6 +51,7 @@ def decode_ws_raw(raw: Any) -> WsDecodeResult:
             json_error=True,
             empty_array=False,
             book_items=[],
+            json_error_sample=raw_text[:50],
         )
     book_items: list[dict[str, Any]] = []
     empty_array = False
@@ -67,6 +72,7 @@ def decode_ws_raw(raw: Any) -> WsDecodeResult:
                 json_error=False,
                 empty_array=False,
                 book_items=[],
+                json_error_sample=None,
             )
         if _is_book_item(payload):
             book_items.append(payload)
@@ -77,4 +83,5 @@ def decode_ws_raw(raw: Any) -> WsDecodeResult:
         json_error=False,
         empty_array=empty_array,
         book_items=book_items,
+        json_error_sample=None,
     )
