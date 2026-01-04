@@ -5,6 +5,7 @@ from collections import deque
 import pytest
 
 from pm_arb.capture import RunBootstrap
+from pm_arb.capture import monotonic_ns
 from pm_arb.capture_format import FrameRecord
 from pm_arb.capture_online import (
     CaptureState,
@@ -23,11 +24,7 @@ async def test_silent_universe_confirm_no_warmup_fatal(tmp_path):
     run_dir.mkdir()
     (run_dir / "metrics").mkdir()
     run = RunBootstrap("run", run_dir, 0, 0)
-    config = Config(
-        capture_heartbeat_interval_seconds=0.01,
-        coverage_warmup_seconds=0.0,
-        capture_use_market_filters=False,
-    )
+    config = Config(capture_heartbeat_interval_seconds=0.01)
     frames_path = run_dir / "capture" / "shard_00.frames"
     idx_path = run_dir / "capture" / "shard_00.idx"
     frames_path.parent.mkdir()
@@ -103,7 +100,7 @@ async def test_backpressure_fatal_emits_missing_tokens(tmp_path, monkeypatch):
     monkeypatch.setattr("pm_arb.capture_online.append_record", slow_append_record)
 
     for _ in range(5):
-        rx_mono_ns = time.monotonic_ns() - 1_000_000_000
+        rx_mono_ns = monotonic_ns() - 1_000_000_000
         _handle_payload(
             state,
             shard,
@@ -114,7 +111,7 @@ async def test_backpressure_fatal_emits_missing_tokens(tmp_path, monkeypatch):
 
     backpressure_p99 = max(shard.stats.backpressure_ns)
     for _ in range(3):
-        await _check_backpressure_fatal(state, time.monotonic_ns(), backpressure_p99)
+        await _check_backpressure_fatal(state, monotonic_ns(), backpressure_p99)
 
     missing_path = run_dir / "missing_tokens.json"
     assert state.fatal_event.is_set()

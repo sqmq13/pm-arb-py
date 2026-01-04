@@ -1,6 +1,6 @@
 from pm_arb.capture_online import _load_pinned_markets
 from pm_arb.config import Config
-from pm_arb.market_select import select_active_binary_markets
+from pm_arb.gamma import select_active_binary_markets
 
 
 def test_select_active_binary_markets_filters_and_orders():
@@ -39,7 +39,7 @@ def test_select_active_binary_markets_filters_and_orders():
     assert [market["id"] for market in truncated] == ["m1"]
 
 
-def test_capture_pins_active_binary_ignores_regex_by_default(monkeypatch):
+def test_capture_pins_active_binary_by_default(monkeypatch):
     markets = [
         {
             "id": "m1",
@@ -61,11 +61,7 @@ def test_capture_pins_active_binary_ignores_regex_by_default(monkeypatch):
     monkeypatch.setattr(
         "pm_arb.capture_online.fetch_markets", lambda *args, **kwargs: markets
     )
-    config = Config(
-        market_regex="^only$",
-        capture_use_market_filters=False,
-        capture_max_markets=10,
-    )
+    config = Config(capture_max_markets=10)
     selected, tokens, universe_mode, market_regex_effective, _ = _load_pinned_markets(
         config
     )
@@ -73,37 +69,3 @@ def test_capture_pins_active_binary_ignores_regex_by_default(monkeypatch):
     assert market_regex_effective is None
     assert {market["id"] for market in selected} == {"m1", "m2"}
     assert tokens == ["t1", "t2", "t3", "t4"]
-
-
-def test_capture_can_enable_filtered_mode_with_capture_use_market_filters_true(monkeypatch):
-    markets = [
-        {
-            "id": "m1",
-            "slug": "only",
-            "question": "q1",
-            "active": True,
-            "clobTokenIds": ["t1", "t2"],
-        },
-        {
-            "id": "m2",
-            "slug": "other",
-            "question": "q2",
-            "active": True,
-            "clobTokenIds": ["t3", "t4"],
-        },
-    ]
-    monkeypatch.setattr(
-        "pm_arb.capture_online.fetch_markets", lambda *args, **kwargs: markets
-    )
-    config = Config(
-        market_regex="^only$",
-        capture_use_market_filters=True,
-        capture_max_markets=10,
-    )
-    selected, tokens, universe_mode, market_regex_effective, _ = _load_pinned_markets(
-        config
-    )
-    assert universe_mode == "filtered"
-    assert market_regex_effective == "^only$"
-    assert [market["id"] for market in selected] == ["m1"]
-    assert tokens == ["t1", "t2"]

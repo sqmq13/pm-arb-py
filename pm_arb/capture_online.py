@@ -9,6 +9,7 @@ import shutil
 import socket
 import struct
 import time
+from math import gcd
 from collections import deque
 from dataclasses import dataclass, field, fields
 from pathlib import Path
@@ -17,7 +18,7 @@ from typing import Any, Iterable
 import orjson
 import websockets
 
-from .capture import RunBootstrap, _append_ndjson, _write_json, bootstrap_run
+from .capture import RunBootstrap, _append_ndjson, _write_json, bootstrap_run, monotonic_ns
 from .capture_format import (
     FLAG_BINARY_PAYLOAD,
     FLAG_TEXT_PAYLOAD,
@@ -30,20 +31,19 @@ from .capture_format import (
 from .capture_offline import quantile
 from .clob_ws import build_subscribe_payload
 from .config import Config
-from .gamma import fetch_markets, parse_clob_token_ids
-from .market_select import filter_markets, select_active_binary_markets
+from .gamma import fetch_markets, parse_clob_token_ids, select_active_binary_markets
 
 SUBSCRIBE_VARIANTS = ("A", "B", "C")
 
 FATAL_LOW_DISK = "LOW_DISK"
-FATAL_WARMUP_COVERAGE = "WARMUP_COVERAGE_FAIL"
-FATAL_SUSTAINED_COVERAGE = "SUSTAINED_COVERAGE_FAIL"
 FATAL_DROP = "DROP"
 FATAL_LATENCY = "LATENCY_FATAL"
 FATAL_BACKPRESSURE = "BACKPRESSURE_STALL"
 FATAL_RECONNECT_STORM = "RECONNECT_STORM"
 FATAL_VERIFY = "VERIFY_CORRUPTION"
 FATAL_SUBSCRIBE_CONFIRM = "SUBSCRIBE_CONFIRM_FAIL"
+FATAL_SHARD_ASSIGNMENT = "SHARD_ASSIGNMENT_INVALID"
+FATAL_MONO_QUANTIZED = "MONO_TIME_QUANTIZED"
 FATAL_INTERNAL = "INTERNAL_ASSERT"
 
 
@@ -107,7 +107,6 @@ class CaptureState:
     config: Config
     shards: list[ShardState]
     pinned_tokens: list[str]
-    warmup_complete: bool = False
     backpressure_breach_count: int = 0
     fatal_event: asyncio.Event = field(default_factory=asyncio.Event)
     fatal_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
@@ -125,6 +124,54 @@ def _quantile_from_samples(samples: Iterable[int], percentile: float) -> int:
     if not values:
         return 0
     return quantile(values, percentile)
+
+
+class ShardAssignmentError(RuntimeError):
+    def __init__(
+        self,
+        message: str,
+        errors: list[dict[str, Any]],
+        shard_map: dict[int, list[str]],
+        market_shards: dict[str, int],
+    ) -> None:
+        super().__init__(message)
+        self.errors = errors
+        self.shard_map = shard_map
+        self.market_shards = market_shards
+
+
+def _monotonic_precision_stats(sample_count: int) -> dict[str, Any]:
+    if sample_count < 2:
+        raise ValueError("sample_count must be >= 2")
+    stamps = [monotonic_ns() for _ in range(sample_count)]
+    deltas = [
+        later - earlier
+        for earlier, later in zip(stamps, stamps[1:])
+        if later > earlier
+    ]
+    any_non_ms = any(stamp % 1_000_000 != 0 for stamp in stamps)
+    stats: dict[str, Any] = {
+        "sample_count": sample_count,
+        "any_non_ms": any_non_ms,
+    }
+    if not deltas:
+        stats["ok"] = False
+        stats["reason"] = "no_positive_deltas"
+        return stats
+    delta_gcd = deltas[0]
+    for delta in deltas[1:]:
+        delta_gcd = gcd(delta_gcd, delta)
+    stats.update(
+        {
+            "delta_gcd_ns": delta_gcd,
+            "min_delta_ns": min(deltas),
+            "max_delta_ns": max(deltas),
+        }
+    )
+    stats["ok"] = any_non_ms and delta_gcd < 1_000_000
+    if not stats["ok"]:
+        stats["reason"] = "quantized"
+    return stats
 
 
 def _config_snapshot(config: Config) -> dict[str, Any]:
@@ -213,13 +260,69 @@ def _select_confirm_tokens(
     return ordered[: min(max_tokens, len(ordered))]
 
 
-def assign_shards(token_ids: Iterable[str], shard_count: int) -> dict[int, list[str]]:
-    tokens = sorted(str(token_id) for token_id in token_ids)
+def assign_shards_by_market(
+    markets: list[dict[str, Any]],
+    shard_count: int,
+) -> tuple[dict[int, list[str]], dict[str, int]]:
+    if shard_count <= 0:
+        raise ValueError("shard_count must be >= 1")
     shards: dict[int, list[str]] = {idx: [] for idx in range(shard_count)}
-    for token_id in tokens:
-        shard_id = _stable_hash(token_id) % shard_count
-        shards[shard_id].append(token_id)
-    return shards
+    shard_sets: dict[int, set[str]] = {idx: set() for idx in range(shard_count)}
+    market_shards: dict[str, int] = {}
+    token_shards: dict[str, int] = {}
+    errors: list[dict[str, Any]] = []
+
+    for market in markets:
+        market_id = market.get("id")
+        if market_id is None:
+            errors.append({"error": "missing_market_id"})
+            continue
+        market_key = str(market_id)
+        shard_id = _stable_hash(market_key) % shard_count
+        prior_market_shard = market_shards.get(market_key)
+        if prior_market_shard is not None and prior_market_shard != shard_id:
+            errors.append(
+                {
+                    "error": "market_multi_shard",
+                    "market_id": market_key,
+                    "first_shard": prior_market_shard,
+                    "second_shard": shard_id,
+                }
+            )
+            continue
+        market_shards[market_key] = shard_id
+
+        token_ids = market.get("token_ids") or market.get("tokenIds")
+        if not isinstance(token_ids, list) or len(token_ids) != 2:
+            errors.append(
+                {
+                    "error": "market_tokens_invalid",
+                    "market_id": market_key,
+                }
+            )
+            continue
+        for token_id in token_ids:
+            token_key = str(token_id)
+            prior_token_shard = token_shards.get(token_key)
+            if prior_token_shard is not None and prior_token_shard != shard_id:
+                errors.append(
+                    {
+                        "error": "token_multi_shard",
+                        "token_id": token_key,
+                        "first_shard": prior_token_shard,
+                        "second_shard": shard_id,
+                        "market_id": market_key,
+                    }
+                )
+                continue
+            token_shards[token_key] = shard_id
+            if token_key not in shard_sets[shard_id]:
+                shard_sets[shard_id].add(token_key)
+                shards[shard_id].append(token_key)
+
+    if errors:
+        raise ShardAssignmentError("invalid shard assignment", errors, shards, market_shards)
+    return shards, market_shards
 
 
 def split_subscribe_groups(
@@ -316,21 +419,11 @@ def _load_pinned_markets(
         limit=config.gamma_limit,
         max_markets=config.capture_max_markets,
     )
-    if config.capture_use_market_filters:
-        selected_markets = filter_markets(
-            markets,
-            market_regex=config.market_regex,
-            secondary_filter_enable=config.secondary_filter_enable,
-            max_markets=config.capture_max_markets,
-        )
-        universe_mode = "filtered"
-        market_regex_effective: str | None = config.market_regex
-    else:
-        selected_markets = select_active_binary_markets(
-            markets, max_markets=config.capture_max_markets
-        )
-        universe_mode = "active-binary"
-        market_regex_effective = None
+    selected_markets = select_active_binary_markets(
+        markets, max_markets=config.capture_max_markets
+    )
+    universe_mode = "active-binary"
+    market_regex_effective: str | None = None
     selected: list[dict[str, Any]] = []
     tokens: set[str] = set()
     for market in selected_markets:
@@ -452,7 +545,7 @@ def _cap_missing_tokens(
     }
 
 
-def _build_missing_tokens_report(
+def _build_missing_tokens_dump(
     state: CaptureState,
     reason: str,
     now_ns: int,
@@ -494,6 +587,32 @@ def _write_metrics(path: Path, record: dict[str, Any]) -> None:
     _append_ndjson(path, record)
 
 
+def _write_startup_fatal(
+    run: RunBootstrap,
+    reason: str,
+    message: str,
+    *,
+    extra: dict[str, Any] | None = None,
+) -> None:
+    _write_runlog(
+        run.run_dir,
+        {
+            "record_type": "fatal",
+            "run_id": run.run_id,
+            "fatal_reason": reason,
+            "fatal_message": message,
+        },
+    )
+    payload = {
+        "fatal_reason": reason,
+        "fatal_message": message,
+        "run_id": run.run_id,
+    }
+    if extra:
+        payload.update(extra)
+    _write_json(run.run_dir / "fatal.json", payload)
+
+
 def _all_shards_confirmed(state: CaptureState) -> bool:
     return all(shard.confirmed for shard in state.shards)
 
@@ -512,14 +631,11 @@ async def _check_backpressure_fatal(
         state.backpressure_breach_count = 0
     if state.backpressure_breach_count < 3:
         return
-    include_missing = (
-        state.config.capture_use_market_filters and state.config.capture_activity_gates_enable
-    )
-    missing = _build_missing_tokens_report(
+    missing = _build_missing_tokens_dump(
         state,
         FATAL_BACKPRESSURE,
         now_ns,
-        include_missing_list=include_missing,
+        include_missing_list=False,
         window_ns=None,
     )
     missing["backpressure_ns_p99"] = global_backpressure_p99
@@ -570,8 +686,6 @@ async def _trigger_fatal(
 
 async def _heartbeat_loop(state: CaptureState) -> None:
     interval_ns = int(state.config.capture_heartbeat_interval_seconds * 1_000_000_000)
-    warmup_ns = int(state.config.coverage_warmup_seconds * 1_000_000_000)
-    sustained_ns = int(state.config.coverage_sustained_window_seconds * 1_000_000_000)
     run_dir = state.run.run_dir
     metrics_global = run_dir / "metrics" / "global.ndjson"
     metrics_shard_paths = {
@@ -580,11 +694,11 @@ async def _heartbeat_loop(state: CaptureState) -> None:
     }
     next_tick = state.run.t0_mono_ns + interval_ns
     while not state.fatal_event.is_set():
-        now_ns = time.monotonic_ns()
+        now_ns = monotonic_ns()
         if now_ns < next_tick:
             await asyncio.sleep((next_tick - now_ns) / 1_000_000_000)
             continue
-        now_ns = time.monotonic_ns()
+        now_ns = monotonic_ns()
         hb_wall_ns_utc = time.time_ns()
         elapsed_ns = now_ns - state.run.t0_mono_ns
         _write_runlog(
@@ -627,7 +741,7 @@ async def _heartbeat_loop(state: CaptureState) -> None:
                 shard.token_ids,
                 shard.last_seen,
                 now_ns,
-                None if not state.warmup_complete else sustained_ns,
+                None,
             )
             shard_record = {
                 "record_type": "heartbeat",
@@ -670,7 +784,6 @@ async def _heartbeat_loop(state: CaptureState) -> None:
             _write_metrics(metrics_shard_paths[shard.shard_id], shard_record)
 
         if state.pinned_tokens:
-            window_ns = None if not state.warmup_complete else sustained_ns
             last_seen_global: dict[str, int] = {}
             for shard in state.shards:
                 last_seen_global.update(shard.last_seen)
@@ -678,7 +791,7 @@ async def _heartbeat_loop(state: CaptureState) -> None:
                 state.pinned_tokens,
                 last_seen_global,
                 now_ns,
-                window_ns,
+                None,
             )
 
         global_record = {
@@ -737,15 +850,11 @@ async def _heartbeat_loop(state: CaptureState) -> None:
             for shard in state.shards
         )
         if deadline_exceeded:
-            include_missing = (
-                state.config.capture_use_market_filters
-                and state.config.capture_activity_gates_enable
-            )
-            missing = _build_missing_tokens_report(
+            missing = _build_missing_tokens_dump(
                 state,
                 FATAL_SUBSCRIBE_CONFIRM,
                 now_ns,
-                include_missing_list=include_missing,
+                include_missing_list=False,
                 window_ns=None,
             )
             await _trigger_fatal(
@@ -755,70 +864,6 @@ async def _heartbeat_loop(state: CaptureState) -> None:
                 missing_tokens=missing,
             )
             break
-
-        if not state.warmup_complete and elapsed_ns >= warmup_ns:
-            if not _all_shards_confirmed(state):
-                continue
-            activity_gates = (
-                state.config.capture_use_market_filters
-                and state.config.capture_activity_gates_enable
-            )
-            if activity_gates:
-                global_ok = global_coverage_pct >= state.config.coverage_warmup_global_pct
-                shard_ok = True
-                for shard in state.shards:
-                    shard_pct = _coverage_pct(shard.token_ids, shard.last_seen, now_ns, None)
-                    if shard_pct < state.config.coverage_warmup_shard_pct:
-                        shard_ok = False
-                        break
-                if not global_ok or not shard_ok:
-                    missing = _build_missing_tokens_report(
-                        state,
-                        FATAL_WARMUP_COVERAGE,
-                        now_ns,
-                        include_missing_list=activity_gates,
-                        window_ns=None,
-                    )
-                    await _trigger_fatal(
-                        state,
-                        FATAL_WARMUP_COVERAGE,
-                        "warmup coverage below threshold",
-                        missing_tokens=missing,
-                    )
-                    break
-            if _all_shards_confirmed(state):
-                state.warmup_complete = True
-
-        if state.warmup_complete:
-            activity_gates = (
-                state.config.capture_use_market_filters
-                and state.config.capture_activity_gates_enable
-            )
-            if activity_gates:
-                global_ok = global_coverage_pct >= state.config.coverage_sustained_global_pct
-                shard_ok = True
-                for shard in state.shards:
-                    shard_pct = _coverage_pct(
-                        shard.token_ids, shard.last_seen, now_ns, sustained_ns
-                    )
-                    if shard_pct < state.config.coverage_sustained_shard_pct:
-                        shard_ok = False
-                        break
-                if not global_ok or not shard_ok:
-                    missing = _build_missing_tokens_report(
-                        state,
-                        FATAL_SUSTAINED_COVERAGE,
-                        now_ns,
-                        include_missing_list=activity_gates,
-                        window_ns=sustained_ns,
-                    )
-                    await _trigger_fatal(
-                        state,
-                        FATAL_SUSTAINED_COVERAGE,
-                        "sustained coverage below threshold",
-                        missing_tokens=missing,
-                    )
-                    break
 
         next_tick = now_ns + interval_ns
 
@@ -832,7 +877,7 @@ def _handle_payload(
     rx_wall_ns_utc: int,
 ) -> None:
     payload_bytes, flags = _payload_bytes(raw)
-    write_start_ns = time.monotonic_ns()
+    write_start_ns = monotonic_ns()
     record = append_record(
         shard.frames_fh,
         shard.idx_fh,
@@ -842,7 +887,7 @@ def _handle_payload(
         flags=flags,
         schema_version=state.config.capture_frames_schema_version,
     )
-    write_end_ns = time.monotonic_ns()
+    write_end_ns = monotonic_ns()
     backpressure_ns = max(0, write_start_ns - rx_mono_ns)
     header_struct = frames_header_struct(record.schema_version)
     if record.schema_version == 1:
@@ -930,7 +975,7 @@ async def _run_shard(state: CaptureState, shard: ShardState) -> None:
                 shard.confirmed = False
                 shard.confirm_events_seen = 0
                 shard.confirm_deadline_mono_ns = (
-                    time.monotonic_ns()
+                    monotonic_ns()
                     + int(state.config.capture_confirm_timeout_seconds * 1_000_000_000)
                 )
 
@@ -950,7 +995,7 @@ async def _run_shard(state: CaptureState, shard: ShardState) -> None:
                             "confirm_events_seen": shard.confirm_events_seen,
                         },
                     )
-                    if shard.confirm_failures >= state.config.ws_confirm_max_failures:
+                    if shard.confirm_failures >= state.config.capture_confirm_max_failures:
                         await _trigger_fatal(
                             state,
                             FATAL_SUBSCRIBE_CONFIRM,
@@ -976,16 +1021,16 @@ async def _run_shard(state: CaptureState, shard: ShardState) -> None:
                     )
 
                 while not state.fatal_event.is_set():
-                    await _check_confirm_deadline(time.monotonic_ns())
+                    await _check_confirm_deadline(monotonic_ns())
                     try:
                         raw = await asyncio.wait_for(ws.recv(), timeout=1.0)
                     except asyncio.TimeoutError:
-                        await _check_confirm_deadline(time.monotonic_ns())
+                        await _check_confirm_deadline(monotonic_ns())
                         continue
 
-                    rx_mono_ns = time.monotonic_ns()
+                    rx_mono_ns = monotonic_ns()
                     rx_wall_ns_utc = time.time_ns()
-                    await _check_confirm_deadline(time.monotonic_ns())
+                    await _check_confirm_deadline(monotonic_ns())
                     _handle_payload(
                         state,
                         shard,
@@ -1018,12 +1063,19 @@ async def _run_shard(state: CaptureState, shard: ShardState) -> None:
 async def _capture_online_async(config: Config, run_id: str | None = None) -> int:
     if config.ws_shards <= 0:
         raise ValueError("ws_shards must be >= 1")
-    markets, pinned_tokens, universe_mode, market_regex_effective, selected_markets = (
-        _load_pinned_markets(config)
+    markets, pinned_tokens, universe_mode, _, selected_markets = _load_pinned_markets(
+        config
     )
     if not pinned_tokens:
         raise RuntimeError("no pinned tokens available for capture")
-    shard_map = assign_shards(pinned_tokens, config.ws_shards)
+    assignment_errors: list[dict[str, Any]] | None = None
+    market_shards: dict[str, int] = {}
+    try:
+        shard_map, market_shards = assign_shards_by_market(markets, config.ws_shards)
+    except ShardAssignmentError as exc:
+        shard_map = exc.shard_map
+        market_shards = exc.market_shards
+        assignment_errors = exc.errors
     scores = _token_score_map(selected_markets)
     confirm_token_map = {
         shard_id: _select_confirm_tokens(
@@ -1045,13 +1097,13 @@ async def _capture_online_async(config: Config, run_id: str | None = None) -> in
         "payload_source": "text",
         "payload_encoder": "utf-8",
         "universe_mode": universe_mode,
-        "capture_use_market_filters": config.capture_use_market_filters,
-        "market_regex_effective": market_regex_effective,
+        "monotonic_ns_source": "perf_counter_ns",
         "git_commit": _read_git_commit(),
         "environment": _environment_metadata(),
         "config": _config_snapshot(config),
         "pinned_tokens": pinned_tokens,
         "pinned_markets": markets,
+        "market_shards": market_shards,
         "shards": {
             "count": config.ws_shards,
             "assignments": {
@@ -1068,6 +1120,32 @@ async def _capture_online_async(config: Config, run_id: str | None = None) -> in
     run = bootstrap_run(config, run_id=run_id, manifest_extra=manifest_extra)
     run_dir = run.run_dir
     print(f"capture run dir: {run_dir}")
+    if assignment_errors:
+        _write_startup_fatal(
+            run,
+            FATAL_SHARD_ASSIGNMENT,
+            "invalid shard assignment",
+            extra={"shard_assignment_errors": assignment_errors},
+        )
+        return 1
+
+    precision = _monotonic_precision_stats(sample_count=200)
+    _write_runlog(
+        run_dir,
+        {
+            "record_type": "monotonic_precision",
+            "run_id": run.run_id,
+            **precision,
+        },
+    )
+    if not precision.get("ok", False):
+        _write_startup_fatal(
+            run,
+            FATAL_MONO_QUANTIZED,
+            "monotonic clock precision insufficient",
+            extra={"monotonic_precision": precision},
+        )
+        return 1
     shards: list[ShardState] = []
     for shard_id, token_ids in shard_map.items():
         frames_path = run_dir / "capture" / f"shard_{shard_id:02d}.frames"

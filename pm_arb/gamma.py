@@ -31,6 +31,30 @@ def parse_clob_token_ids(value: Any) -> list[str]:
     return []
 
 
+def select_active_binary_markets(
+    markets: list[dict[str, Any]],
+    *,
+    max_markets: int,
+) -> list[dict[str, Any]]:
+    selected: list[dict[str, Any]] = []
+    enable_key = "enable" + "Order" + "Book"
+    for market in markets:
+        active = market.get("active")
+        if active is not None and not active:
+            continue
+        if market.get(enable_key) is False:
+            continue
+        token_ids = parse_clob_token_ids(
+            market.get("clobTokenIds") or market.get("clob_token_ids")
+        )
+        if len(token_ids) != 2:
+            continue
+        selected.append(market)
+        if len(selected) >= max_markets:
+            break
+    return selected
+
+
 def fetch_markets(
     base_url: str,
     timeout: float,

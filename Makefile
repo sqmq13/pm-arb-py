@@ -1,6 +1,6 @@
 UV ?= uv
 
-.PHONY: setup test run report contract-test discover run-offline report-offline
+.PHONY: setup test discover capture-bench-offline capture-verify
 
 setup:
 	$(UV) venv .venv
@@ -10,20 +10,11 @@ setup:
 test:
 	$(UV) run python -m pytest
 
-run:
-	$(UV) run pm_arb scan
-
-report:
-	$(UV) run pm_arb report
-
-contract-test:
-	$(UV) run pm_arb contract-test
-
 discover:
 	$(UV) run pm_arb discover
 
-run-offline:
-	$(UV) run pm_arb scan --offline --fixtures-dir testdata/fixtures
+capture-bench-offline:
+	$(UV) run pm_arb capture-bench --offline --fixtures-dir testdata/fixtures
 
-report-offline:
-	$(UV) run pm_arb report
+capture-verify:
+	$(UV) run pm_arb capture-verify --run-dir $(RUN_DIR)

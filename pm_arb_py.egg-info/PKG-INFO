@@ -1,14 +1,13 @@
 Metadata-Version: 2.4
 Name: pm-arb-py
 Version: 0.1.0
-Summary: Phase-1 Polymarket Strategy-A scanner
+Summary: Phase 1 capture/ingest plant.
 Requires-Python: >=3.11
 Description-Content-Type: text/markdown
 Requires-Dist: orjson>=3.9.15
 Requires-Dist: requests>=2.31.0
 Requires-Dist: uvloop>=0.19.0; platform_system != "Windows"
 Requires-Dist: websockets>=12.0
-Requires-Dist: websocket-client>=1.7.0
 
 # pm-arb-py - Phase 1 Capture and Scanner
 
@@ -17,7 +16,7 @@ Phase-1 data collection and measurement only. This repository does not place ord
 ## Phase 1 North Star (Capture)
 
 - Capture raw Polymarket CLOB WS frames (full L2 when present) for a large binary-market universe.
-- Timestamp each received frame with `rx_mono_ns` (monotonic receive time).
+- Timestamp each received frame with `rx_mono_ns` (monotonic) and `rx_wall_ns_utc` (UTC wall clock), stored as ns integers.
 - Provide wall-clock anchors in `manifest.json` (`t0_wall_ns_utc`, `t0_mono_ns`) and runlog heartbeats (`hb_wall_ns_utc`, `hb_mono_ns`).
 - Keep capture records raw (no orderbook building, no normalization, no Decimal parsing).
 - Emit reproducible run bundles with manifest + pinned token set + shard mapping.
@@ -46,6 +45,7 @@ uv run python -m pytest
 - `pm_arb report`
 - `pm_arb contract-test` (online/offline)
 - `pm_arb discover`
+- `pm_arb discover --universe active-binary` (show capture universe)
 - `pm_arb capture` (online capture; requires network access)
 - `pm_arb capture --offline` (fixtures-only capture)
 - `pm_arb capture-verify` (verifies `.frames` and optional `.idx`; add `--summary-only` for totals-only JSON)
@@ -55,6 +55,11 @@ uv run python -m pytest
 - `pm_arb capture-slice --run-dir <path> --start-offset <bytes> --end-offset <bytes>` (offset window)
 
 All commands exit non-zero on failure.
+
+Universe selection:
+- Default capture pins the active-binary YES/NO universe (ignores regex filters).
+- Opt-in filtered capture by setting `capture_use_market_filters=true`.
+- Use `pm_arb discover --universe active-binary` to inspect the capture universe.
 
 ## Output Layout
 
@@ -77,24 +82,75 @@ On fatal:
 
 ## Data Formats and Schema Versioning
 
-Frames are binary and preserve WS frame boundaries:
+Frames are binary and preserve WS frame boundaries (schema v2 default; v1 readable):
 - Path: `data/runs/<run_id>/capture/shard_<NN>.frames`
 - Layout (little-endian):
-  - magic: `b"PMCAPv01"` (8 bytes)
-  - schema_version: u16
-  - flags: u16
-  - rx_mono_ns: u64
-  - payload_len: u32
-  - payload_crc32: u32
-  - payload_bytes: payload_len
+  - v2:
+    - magic: `b"PMCAPv02"` (8 bytes)
+    - schema_version: u16
+    - flags: u16
+    - rx_mono_ns: u64
+    - rx_wall_ns_utc: u64
+    - payload_len: u32
+    - payload_crc32: u32
+    - payload_bytes: payload_len
+  - v1 (legacy):
+    - magic: `b"PMCAPv01"` (8 bytes)
+    - schema_version: u16
+    - flags: u16
+    - rx_mono_ns: u64
+    - payload_len: u32
+    - payload_crc32: u32
+    - payload_bytes: payload_len
 
 Index records align 1:1 with frames:
 - Path: `data/runs/<run_id>/capture/shard_<NN>.idx`
 - Layout (little-endian):
-  - offset_frames: u64
-  - rx_mono_ns: u64
-  - payload_len: u32
-  - payload_crc32: u32
+  - v2:
+    - offset_frames: u64
+    - rx_mono_ns: u64
+    - rx_wall_ns_utc: u64
+    - payload_len: u32
+    - payload_crc32: u32
+  - v1 (legacy):
+    - offset_frames: u64
+    - rx_mono_ns: u64
+    - payload_len: u32
+    - payload_crc32: u32
+
+To force v1 writes for a run, set `capture_frames_schema_version=1` (CLI or env).
+
+## Capture Dataset Contract
+
+Capture run bundle (all files under `data/runs/<run_id>/`):
+- `manifest.json` includes schema version, config snapshot, pinned universe, shard map, and environment metadata.
+- `runlog.ndjson` contains run lifecycle and heartbeat records.
+- `capture/shard_<NN>.frames` stores raw WS frame payloads with per-frame `rx_mono_ns` and `rx_wall_ns_utc`.
+- `capture/shard_<NN>.idx` provides 1:1 offsets + timestamps for fast slicing.
+- `metrics/*.ndjson` contain ingest/write latency metrics and per-shard counters.
+
+Contract invariants:
+- Payload bytes are written exactly as received (no normalization, no truncation).
+- Both monotonic and wall-clock timestamps are stored per frame as ns integers.
+- Schema v1 is always readable; new runs default to v2.
+- Universe selection is explicit in `manifest.json` (`universe_mode`, `capture_use_market_filters`, `market_regex_effective`).
+
+Verification and tools:
+```bash
+pm_arb capture-verify --run-dir data/runs/<run_id>
+pm_arb capture-inspect --run-dir data/runs/<run_id>
+pm_arb capture-slice --run-dir data/runs/<run_id> --start-mono-ns <ns> --end-mono-ns <ns>
+```
+
+## Phase 2 Readiness
+
+Phase 2 replay depends on per-frame timestamps and raw payload bytes:
+- `rx_mono_ns` for deterministic ordering and replay scheduling.
+- `rx_wall_ns_utc` for aligning captures to external clocks.
+- `payload_bytes` for L2 reconstruction without Phase 1 normalization.
+- `manifest.json` shard assignments for deterministic replay partitioning.
+
+See `docs/PHASE2_READY.md` for the exact fields and latency decomposition guidance.
 
 ## Verification and Debugging
 
@@ -119,12 +175,17 @@ Run an offline ingest benchmark on fixtures:
 ```bash
 pm_arb capture-bench --offline --fixtures-dir testdata/fixtures
 ```
+Scale the workload by repeating fixtures:
+```bash
+pm_arb capture-bench --offline --fixtures-dir testdata/fixtures --multiplier 200
+```
 
 ## Troubleshooting
 
 - Coverage low or missing tokens: inspect `metrics/*.ndjson`, verify `missing_tokens.json` on fatal, and check shard assignment in `manifest.json`.
 - Reconnect loops: look for repeated `reconnect` events in `runlog.ndjson`.
 - Disk stalls: ensure free disk is above `min_free_disk_gb`; low disk triggers a fatal.
+- Backpressure stalls: watch `backpressure_ns_p99` in `metrics/*.ndjson` and tune `capture_backpressure_fatal_ms` if needed.
 - Corruption/truncation: run `capture-verify` to locate the first bad offset; truncated files often indicate an unclean shutdown.
 
 ## Configuration

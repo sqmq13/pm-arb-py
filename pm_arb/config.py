@@ -3,8 +3,6 @@ from __future__ import annotations
 from dataclasses import dataclass, fields
 from typing import Any
 
-from .fixed import PRICE_SCALE, parse_sizes_list
-
 ENV_PREFIX = "PM_ARB_"
 
 
@@ -37,80 +35,26 @@ def _is_field_type(field_type, expected: type, expected_name: str) -> bool:
 class Config:
     gamma_base_url: str = "https://gamma-api.polymarket.com"
     gamma_limit: int = 100
-    clob_rest_base_url: str = "https://clob.polymarket.com"
-    clob_ws_url: str = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
-    geoblock_url: str = "https://polymarket.com/api/geoblock"
-    markets_poll_interval: float = 20.0
-    market_regex: str = (
-        r"(?i)\b15\b.*(min|minute).*(BTC|ETH|SOL)|\b(BTC|ETH|SOL)\b.*\b15\b.*(min|minute)"
-    )
-    secondary_filter_enable: bool = True
-    max_markets: int = 5000
-    top_k: int = 50
-    sizes: str = "10,50,100,250,500"
-    sizes_auto_warmup_minutes: int = 20
-    buffer_per_share: float = 0.005
-    price_scale: int = PRICE_SCALE
-    stale_seconds: float = 2.0
-    ws_disconnect_alarm_seconds: float = 5.0
-    ws_ping_interval_seconds: float = 15.0
-    ws_read_timeout_seconds: float = 60.0
-    resync_interval: float = 60.0
     rest_timeout: float = 10.0
-    rest_snapshot_sample_min: int = 25
-    rest_snapshot_sample_pct: float = 0.10
-    rest_rate_per_sec: int = 10
-    rest_burst: int = 20
-    rest_retry_max: int = 6
-    contract_timeout: float = 10.0
-    ws_sample_capture_n: int = 20
-    ws_initial_parse_fail_threshold_pct: float = 0.10
-    reconcile_mismatch_persist_n: int = 3
-    reconcile_tick_tolerance: int = 2
-    reconcile_rel_tol: float = 0.20
+    clob_ws_url: str = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
     ws_shards: int = 8
     ws_subscribe_max_tokens: int = 500
     ws_subscribe_max_bytes: int = 32768
-    ws_confirm_timeout_seconds: float = 30.0
-    ws_confirm_min_pct: float = 80.0
-    ws_confirm_max_failures: int = 3
     ws_reconnect_max: int = 10
     ws_reconnect_backoff_seconds: float = 1.0
     capture_frames_schema_version: int = 2
-    capture_use_market_filters: bool = False
     capture_max_markets: int = 5000
     capture_confirm_tokens_per_shard: int = 25
     capture_confirm_timeout_seconds: float = 45.0
     capture_confirm_min_events: int = 1
-    capture_activity_gates_enable: bool = False
+    capture_confirm_max_failures: int = 3
     capture_backpressure_fatal_ms: float = 250.0
-    coverage_warmup_seconds: float = 60.0
-    coverage_warmup_global_pct: float = 99.0
-    coverage_warmup_shard_pct: float = 98.0
-    coverage_sustained_window_seconds: float = 60.0
-    coverage_sustained_global_pct: float = 99.0
-    coverage_sustained_shard_pct: float = 98.0
     capture_ring_buffer_frames: int = 4096
     capture_metrics_max_samples: int = 5000
     capture_heartbeat_interval_seconds: float = 1.0
     data_dir: str = "./data"
-    heartbeat_interval: float = 5.0
-    log_rotate_mb: int = 256
-    log_rotate_keep: int = 20
     min_free_disk_gb: int = 5
     offline: bool = False
-
-    def sizes_list(self) -> list[int] | None:
-        if str(self.sizes).strip().lower() == "auto":
-            return None
-        return parse_sizes_list(self.sizes)
-
-    def buffer_per_share_micro(self) -> int:
-        from decimal import Decimal, ROUND_CEILING
-
-        dec = Decimal(str(self.buffer_per_share))
-        micro = (dec * Decimal(self.price_scale)).to_integral_value(rounding=ROUND_CEILING)
-        return int(micro)
 
     def apply_overrides(self, overrides: dict[str, Any]) -> "Config":
         for field in fields(self):
@@ -136,9 +80,4 @@ class Config:
             else:
                 value = raw
             setattr(cfg, field.name, value)
-        if "capture_max_markets" not in cli_overrides and (
-            ENV_PREFIX + "CAPTURE_MAX_MARKETS"
-        ) not in env:
-            if "max_markets" in cli_overrides or (ENV_PREFIX + "MAX_MARKETS") in env:
-                cfg.capture_max_markets = cfg.max_markets
         return cfg

@@ -1,0 +1,34 @@
+import pkgutil
+
+import pm_arb
+import pm_arb.cli
+
+
+def test_phase1_allowlist() -> None:
+    allowlist = {
+        "cli",
+        "config",
+        "gamma",
+        "clob_ws",
+        "ws_decode",
+        "capture",
+        "capture_online",
+        "capture_offline",
+        "capture_format",
+        "capture_inspect",
+        "capture_slice",
+    }
+    banned = {
+        "book",
+        "fixed",
+        "engine",
+        "sweep",
+        "reconcile",
+        "report",
+        "base_scan",
+        "scan",
+        "strategy",
+    }
+    modules = {info.name for info in pkgutil.iter_modules(pm_arb.__path__)}
+    assert modules.issubset(allowlist)
+    assert modules.isdisjoint(banned)

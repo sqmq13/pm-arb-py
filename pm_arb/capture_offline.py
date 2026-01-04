@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
 
-from .capture import RunBootstrap, _append_ndjson, bootstrap_run
+from .capture import RunBootstrap, _append_ndjson, bootstrap_run, monotonic_ns
 from .capture_format import (
     append_record,
     frames_header_len,
@@ -246,9 +246,9 @@ def run_capture_offline(
             for frame in _iter_frames_from_fixture(fixtures_dir):
                 payload_text = json.dumps(frame, ensure_ascii=True, separators=(",", ":"))
                 payload_bytes = payload_text.encode("utf-8")
-                rx_mono_ns = time.monotonic_ns()
+                rx_mono_ns = monotonic_ns()
                 rx_wall_ns_utc = run.t0_wall_ns_utc + (rx_mono_ns - run.t0_mono_ns)
-                write_start_ns = time.monotonic_ns()
+                write_start_ns = monotonic_ns()
                 record = append_record(
                     frames_fh,
                     idx_fh,
@@ -257,7 +257,7 @@ def run_capture_offline(
                     rx_wall_ns_utc,
                     schema_version=config.capture_frames_schema_version,
                 )
-                write_end_ns = time.monotonic_ns()
+                write_end_ns = monotonic_ns()
                 write_duration_ns = write_end_ns - write_start_ns
                 ingest_latency_ns = write_end_ns - rx_mono_ns
                 token_ids, msg_types = _extract_minimal_fields(frame)
@@ -283,7 +283,7 @@ def run_capture_offline(
         os.fsync(frames_fh.fileno())
         os.fsync(idx_fh.fileno())
 
-    end_mono_ns = time.monotonic_ns()
+    end_mono_ns = monotonic_ns()
     elapsed_ns = end_mono_ns - start_mono_ns
     hb_wall_ns_utc = time.time_ns()
     _write_heartbeat(run_dir, run.run_id, hb_wall_ns_utc, end_mono_ns)

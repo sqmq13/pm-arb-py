@@ -11,6 +11,11 @@ from .config import Config
 MANIFEST_VERSION = 1
 
 
+def monotonic_ns() -> int:
+    # perf_counter_ns is higher resolution than monotonic_ns on some platforms.
+    return time.perf_counter_ns()
+
+
 class RunBootstrap:
     def __init__(self, run_id: str, run_dir: Path, t0_wall_ns_utc: int, t0_mono_ns: int):
         self.run_id = run_id
@@ -50,7 +55,7 @@ def bootstrap_run(
     (run_dir / "metrics").mkdir()
 
     t0_wall_ns_utc = time.time_ns()
-    t0_mono_ns = time.monotonic_ns()
+    t0_mono_ns = monotonic_ns()
     manifest = {
         "manifest_version": MANIFEST_VERSION,
         "run_id": run_id,
