@@ -9,9 +9,6 @@ Requires-Dist: requests>=2.31.0
 Requires-Dist: uvloop>=0.19.0; platform_system != "Windows"
 Requires-Dist: websockets>=12.0
 Requires-Dist: websocket-client>=1.7.0
-Provides-Extra: dev
-Requires-Dist: pytest>=8.0.0; extra == "dev"
-Requires-Dist: pytest-asyncio>=0.23.6; extra == "dev"
 
 # pm-arb-py - Phase 1 Strategy-A Scanner
 
@@ -37,6 +34,28 @@ make report
 - NDJSON logs: `data/logs/YYYY-MM-DD/events.ndjson` (+ rotated)
 - WS schema capture: `data/debug/ws_samples.jsonl` (first N messages)
 - Reports: `data/reports/summary.json` and `data/reports/summary.csv`
+- Capture runs: `data/runs/<run_id>/` (manifest + runlog; capture/metrics subdirs)
+
+## Capture Format (Phase 1)
+
+Frames are binary and preserve WS frame boundaries:
+- Path: `data/runs/<run_id>/capture/shard_<NN>.frames`
+- Layout (little-endian):
+  - magic: `b"PMCAPv01"` (8 bytes)
+  - schema_version: u16
+  - flags: u16
+  - rx_mono_ns: u64
+  - payload_len: u32
+  - payload_crc32: u32
+  - payload_bytes: payload_len
+
+Index records align 1:1 with frames:
+- Path: `data/runs/<run_id>/capture/shard_<NN>.idx`
+- Layout (little-endian):
+  - offset_frames: u64
+  - rx_mono_ns: u64
+  - payload_len: u32
+  - payload_crc32: u32
 
 ## Interpreting `summary.json` (go / no-go)
 
@@ -61,6 +80,12 @@ PM_ARB_MARKET_REGEX="(?i)\\b5\\b.*(min|minute).*(BTC|ETH|SOL)" pm_arb discover
 - `pm_arb report`
 - `pm_arb contract-test` (online/offline)
 - `pm_arb discover`
+- `pm_arb capture` (online capture; requires network access)
+- `pm_arb capture --offline` (fixtures-only capture)
+- `pm_arb capture-verify` (verifies `.frames` and optional `.idx`)
+- `pm_arb capture-bench --offline` (bench fixtures; prints msgs/sec, bytes/sec, p99 write/ingest)
+- `pm_arb capture-inspect` (stub, exits non-zero)
+- `pm_arb capture-slice` (stub, exits non-zero)
 
 All commands exit non-zero on failure.
 

@@ -1,185 +1,175 @@
-# AGENTS.md — pm-arb-py (Phase 1 Scanner)
+# AGENTS.md (authoritative)
 
-This repository is a **Phase-1 data collection and measurement system** for Polymarket “Strategy A” edge windows. It is **not** a trading bot. It must produce defensible metrics in 12–24 hours without fragile assumptions.
+This file is the working contract for coding agents operating on this repository. If a rule here conflicts with a comment, doc, or old instruction elsewhere in the repo, this file wins.
 
-If you are an automated coding agent: treat this file as the authoritative scope and acceptance criteria.
+The program is multi-phase:
+- Phase 1: Capture / ingest (correct, reproducible, high-throughput dataset).
+- Phase 2: Offline processing + replay + paper trading (no real money).
+- Phase 3: Live execution (real money).
 
-## Scope
+Unless a task explicitly says otherwise, assume Phase 1 only.
 
-### What this repo builds
-A Python CLI `pm_arb` that can:
+---
 
-- `scan` (online): discover eligible markets, ingest orderbooks via WS/REST, compute Strategy-A edge windows, log NDJSON.
-- `scan --offline`: replay fixtures deterministically (development/test).
-- `contract-test` (online/offline): validate WS subscription + book decoding + REST snapshot parsing + basic reconciliation sanity.
-- `discover`: print the top candidate binary markets and show filter match reasons.
-- `report`: aggregate NDJSON into `summary.json` and `summary.csv`.
+## 1) Repo entrypoints and contracts you MUST NOT break
 
-### What this repo does NOT build
-- No order placement, no signing, no wallet management, no execution logic.
-- No geoblock / Cloudflare bypassing. Geoblock is **detection only**.
+CLI entrypoint:
+- `pyproject.toml` defines `pm_arb = "pm_arb.cli:main"`.
+- CLI implementation is `pm_arb/cli.py` (argparse subcommands).
 
-## Strategy A Definition (the only “strategy”)
+Existing CLI commands that MUST keep working:
+- `pm_arb scan`
+- `pm_arb report`
+- `pm_arb contract-test`
+- `pm_arb discover`
 
-A market is eligible if it has exactly **two** `clobTokenIds` (binary).
+Test harness:
+- `Makefile` defines:
+  - `make setup` (creates `.venv`, installs deps, installs package editable)
+  - `make test` (runs `uv run python -m pytest`)
+- The `tests/` directory contains 17 tests. Do not reduce coverage.
 
-For each size `N`:
-- `costA(N)` = sweep-cost to buy `N` shares of token A from asks
-- `costB(N)` = sweep-cost to buy `N` shares of token B from asks
-- Edge condition:  
-  `costA(N) + costB(N) <= N * 1.00 - N * buffer_per_share`
+Offline fixtures:
+- `testdata/fixtures/` is used by `pm_arb scan --offline` and `pm_arb contract-test --offline`.
 
-The scanner must measure **edge windows**: continuous periods where the condition stays true, with:
-- `duration_ms` (monotonic time)
-- `best_edge_per_share` observed
-- churn counters
-- `end_reason`
+Logging/output contract:
+- `pm_arb scan` writes NDJSON to `./data/logs/<YYYY-MM-DD>/events.ndjson` by default.
+- This schema is produced by `pm_arb/engine.py` (see `SCHEMA_VERSION` and `Engine._record()`).
+- Do not change scan output semantics unless explicitly authorized.
 
-## Endpoints (defaults; must be configurable)
+---
 
-- Gamma: `https://gamma-api.polymarket.com`
-- CLOB REST: `https://clob.polymarket.com`
-- CLOB WS: `wss://ws-subscriptions-clob.polymarket.com/ws/`
-- Geoblock (detection only): `https://polymarket.com/api/geoblock`
+## 2) Required workflow (anti-ambiguity fences)
 
-## Non-negotiable Guardrails (avoid fake results)
+Before editing any code, you MUST output four sections:
 
-### 1) No tick logging to disk
-The scanner must **not** write every WS message to NDJSON. NDJSON is event-level:
-- run header
-- heartbeat (e.g., every 5s)
-- alarms
-- market poll summaries
-- window start/end
-- reconciliation results
-- coverage dumps (debug)
+A) FILES TO EDIT
+- List exact paths you will modify/add/remove.
+- One reason per path.
 
-Only exception: WS schema capture is capped to `ws_sample_capture_n` messages.
+B) PLAN
+- Ordered steps.
+- Each step includes how it will be verified (test, invariant, benchmark).
 
-### 2) Log rotation + retention + disk kill switch
-- Rotate `events.ndjson` by size (e.g., `log_rotate_mb`)
-- Keep at most `log_rotate_keep` rotated files
-- Per-day directories `data/logs/YYYY-MM-DD/`
-- If free disk `< min_free_disk_gb`: emit alarm + taint + **exit non-zero cleanly** (better than corrupting output).
+C) BEHAVIOR CHANGES
+- This section MUST be empty unless the task explicitly permits changing behavior.
+- If non-empty, specify exact CLI/format changes.
 
-### 3) Taint propagation + alarms
-If any of these occur, set `tainted=true`, emit ALARM, and ensure windows cannot look “good”:
-- WS disconnect longer than `ws_disconnect_alarm_seconds`
-- initial WS parse failures > threshold in first 100 messages
-- coverage low for multiple polls
-- reconciliation mismatch persists and marks tokens desynced
-- disk pressure alarm
+D) ROLLBACK PLAN
+- File-level rollback steps.
 
-Taint must be visible in:
-- heartbeats
-- window_end records (if ended due to integrity)
-- report outputs (taint_fraction, clean runtime)
+After edits, you MUST provide:
+- The exact command(s) you ran for verification (at minimum: `make test`).
+- The result summary (pass/fail + relevant output).
+- Any new tests added and what they assert.
 
-### 4) Staleness termination
-If either token in a market is stale (no update for `stale_seconds`), end active windows immediately with `end_reason=token_stale`.
+Do not “clean up” unrelated code. Keep diffs tight.
 
-### 5) Persist-based reconciliation (avoid false desync)
-Do not mark a token desynced on a single mismatch. Require persistence:
-- mismatch beyond tolerance must persist `reconcile_mismatch_persist_n` consecutive reconciliations
-- allow tick tolerance and relative tolerance (time skew is real)
+---
 
-### 6) WS subscribe fallback + NO_FEED detection
-Subscription payloads drift. Implement subscribe fallback variants and fail loud in `contract-test` if none work.
+## 3) Phase 1 capture engine rules (what Phase 1 is and is not)
 
-If a subscribed token receives **zero** `book` updates within 30 seconds:
-- mark token state `NO_FEED`
-- alarm + exclude from computations
+Phase 1 goal:
+- Produce a correct, reproducible, high-throughput dataset of Polymarket CLOB WS book updates for ~2000 binary markets (~4000 tokens).
 
-## sizes=auto (must be precise and frozen)
+Phase 1 MUST NOT include:
+- Any trading/execution behavior (orders, signing, keys, wallets).
+- Any arbitrage evaluation logic (edge computation, windowing, sweep-cost decision logic).
+- Any transformations that irreversibly discard WS data.
 
-If `sizes="auto"`:
-- Warm-up for `sizes_auto_warmup_minutes`
-- Collect per token: `max_fillable_shares_within_top_k`
-- For each time sample and each market pair, compute `m(t) = min(maxA(t), maxB(t))`
-- Aggregate `m(t)` across pairs and warm-up times and choose sizes as percentiles (e.g., p50/p75/p90), plus a small baseline if needed.
-- Freeze sizes after warm-up and log them in `run_header`.
+Definition: “full L2” for Phase 1 capture
+- Each captured update MUST preserve both `bids` and `asks` if they are present in the WS payload.
+- Capture MUST NOT apply `top_k`, MUST NOT sort/merge levels, and MUST NOT do Decimal math in the capture hot path.
 
-Offline mode must produce deterministic auto sizes from fixtures.
+Repo-specific warning:
+- `pm_arb/book.py::parse_ws_message()` and `pm_arb/book.py::OrderBook` currently parse and store asks only, and apply `top_k` via `normalize_asks()`.
+- Phase 1 capture MUST NOT use `parse_ws_message()` / `OrderBook` in the capture hot path.
 
-## Outputs
+If you add a capture command:
+- Implement it as a new argparse subcommand in `pm_arb/cli.py` following the existing pattern.
+- Keep `pm_arb/engine.py::Engine.scan_online()` behavior unchanged unless explicitly authorized.
 
-### NDJSON
-Primary log file: `data/logs/YYYY-MM-DD/events.ndjson` (+ rotated)
+---
 
-All records include:
-- `schema_version`
-- `record_type`
-- `run_id`
-- `ts_wall` (RFC3339)
-- `ts_mono_ns`
-- `tainted`
+## 4) Performance and correctness are measurable (no vague wins)
 
-Record types (minimum):
-- `run_header`
-- `heartbeat`
-- `alarm`
-- `market_poll_summary`
-- `window_start`
-- `window_end`
-- `reconcile_result`
-- `coverage_dump` (debug / when coverage low)
+Any “performance improvement” claim MUST reference at least one metric that can be measured in this repo:
+- msgs/sec ingested
+- bytes/sec written
+- p99 recv→append time (end-to-end ingest latency)
+- p99 write duration
+- CPU% and RSS memory
+- coverage % (tokens observed at least once within warmup)
+- dropped frames (count and rate)
+- reconnect rate
 
-### WS schema capture
-`data/debug/ws_samples.jsonl` containing only the first N raw WS messages (capped).
+Hot-path prohibitions unless explicitly justified with measured impact:
+- per-record file open/close (e.g., `with path.open(...)` per event)
+- per-record disk free checks (e.g., `shutil.disk_usage(...)` per event)
+- per-record wall-clock timestamps (e.g., `datetime.now(...)` per event)
+- unbounded queues between WS recv and disk write
+- Decimal parsing in per-message loops (`pm_arb/fixed.py` uses `Decimal` and sets context per call)
+- full sorts/merges of book levels during capture (`pm_arb/book.py::normalize_asks()`)
 
-### Report
-- `data/reports/summary.json`
-- `data/reports/summary.csv`
+---
 
-Must include:
-- windows/hour by size
-- duration percentiles p50/p95/p99 by size
-- edge percentiles p50/p95/p99 by size (cents/share)
-- end_reason distributions
-- taint_fraction and alarms
-- ws downtime, desync/no_feed counts
-- auto sizing summary (warm-up + chosen sizes)
+## 5) Failure handling policy (fail fast with artifacts)
 
-## Offline mode and Fixtures (must exercise failures)
+Phase 1 capture MUST prefer “fail fast with artifacts” over “continue in a bad state”.
 
-Fixtures must include:
-- clean WS book messages
-- extra/unknown fields
-- malformed price/size strings (must taint + alarm without crashing)
-- out-of-order timestamps (must increment ooo drops)
-- Gamma markets fixture
-- REST book fixture
+If you implement capture, fatal conditions MUST be explicit (examples):
+- low disk (see `pm_arb/engine.py::EventLogger._check_disk()` for existing behavior)
+- coverage warmup gate failure (token set not observed)
+- any dropped frames if drop policy is “no drops”
+- sustained write-latency breach (p99 above threshold for N consecutive heartbeats)
+- reconnect storms above a defined cap
+- corrupted/truncated capture files detected by a verifier tool (if you introduce a binary format)
 
-Offline `scan --offline` must replay a mix to ensure taint paths work.
+On fatal exit, write forensic artifacts (paths and filenames must be stable and documented):
+- a JSON summary of counters and failure reason
+- a bounded missing-token dump (if relevant)
+- a bounded sample of recent frames/messages (if relevant)
 
-## Commands and Make Targets
+Do not hide failure behind “tainted” state for Phase 1 capture. The run must fail.
 
-Make targets (must exist):
-- `make setup`
-- `make test`
-- `make run` (online scan)
-- `make report` (latest logs)
-- `make contract-test` (online)
-- `make discover` (online)
-- `make run-offline`
-- `make report-offline`
+---
 
-All commands must exit non-zero on failure.
+## 6) Reproducibility requirements (Phase 2 depends on this)
 
-## Acceptance Checklist (must pass on fresh Ubuntu)
+Phase 1 capture output MUST be reproducible:
+- The run MUST emit a manifest before opening WS sockets.
+- The manifest MUST include:
+  - a schema version for capture files
+  - the git commit hash if available, else “unknown”
+  - full config snapshot (all `pm_arb/config.py::Config` fields used)
+  - the pinned token set and market mapping used for the run
+  - shard mapping if sharding is used
+  - environment metadata needed to reproduce (python version, OS, hostname)
 
-- `make setup`
-- `make test`
-- `make run-offline && make report-offline`
-- `pm_arb contract-test --offline` passes
-- Online `make contract-test` should pass when network access is available
+Do not rely on wall-clock timestamps per frame for reproducibility. Use monotonic receive time for ordering, and store wall-clock in the manifest and periodic heartbeats only.
 
-## Development Rules for Agents
+---
 
-- Do not introduce live trading code.
-- Do not “paper over” schema issues by swallowing exceptions silently.
-- Prefer explicit ALARM + taint + exclusion over optimistic assumptions.
-- Keep the hot path integer-based (no float arithmetic in sweep/cost logic).
-- Keep logs bounded; never write per-tick messages.
+## 7) README.md is part of the deliverable
 
-If anything here conflicts with other docs, AGENTS.md wins for Phase 1.
+Agents MUST keep `README.md` accurate and current.
+
+If you add a command, format, or operational behavior, you MUST update `README.md` in the same change.
+
+Minimum README sections to maintain:
+- Setup (the repo’s actual `make setup` / `make test` workflow)
+- CLI usage (`pm_arb scan/report/contract-test/discover`, plus any new commands you add)
+- Output layout (`data/` structure, what files mean, retention/rotation)
+- Data formats and schema versioning
+- Verification (how to verify capture outputs if a verifier exists)
+- Troubleshooting (coverage issues, reconnect loops, disk stalls, corruption signals)
+
+If README is not updated when contracts change, the work is incomplete.
+
+---
+
+## 8) Operational constraints (do not violate)
+
+- Do not add anything related to geoblock/KYC bypassing.
+- Do not add any secret material (private keys, seed phrases) to repo outputs or logs.
+- Do not assume the operator will run the bot on the desktop; capture runs on the VPS, analysis can run elsewhere.
