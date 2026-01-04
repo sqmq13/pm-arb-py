@@ -25,6 +25,14 @@ def _parse_number(value: str, target_type: type) -> Any:
     return value
 
 
+def _is_field_type(field_type, expected: type, expected_name: str) -> bool:
+    if field_type is expected:
+        return True
+    if isinstance(field_type, str) and field_type == expected_name:
+        return True
+    return False
+
+
 @dataclass
 class Config:
     gamma_base_url: str = "https://gamma-api.polymarket.com"
@@ -111,10 +119,12 @@ class Config:
             if env_key not in env:
                 continue
             raw = env[env_key]
-            if field.type is bool:
+            if _is_field_type(field.type, bool, "bool"):
                 value = _parse_bool(raw)
-            elif field.type in {int, float}:
-                value = _parse_number(raw, field.type)
+            elif _is_field_type(field.type, int, "int"):
+                value = _parse_number(raw, int)
+            elif _is_field_type(field.type, float, "float"):
+                value = _parse_number(raw, float)
             else:
                 value = raw
             setattr(cfg, field.name, value)

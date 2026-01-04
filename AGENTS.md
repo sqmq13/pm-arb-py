@@ -113,9 +113,9 @@ Hot-path prohibitions unless explicitly justified with measured impact:
 
 ---
 
-## 5) Failure handling policy (fail fast with artifacts)
+## 5) Failure handling policy (fail fast)
 
-Phase 1 capture MUST prefer “fail fast with artifacts” over “continue in a bad state”.
+Phase 1 capture MUST prefer fast, explicit failure over continuing in a bad state.
 
 If you implement capture, fatal conditions MUST be explicit (examples):
 - low disk (see `pm_arb/engine.py::EventLogger._check_disk()` for existing behavior)
@@ -124,11 +124,6 @@ If you implement capture, fatal conditions MUST be explicit (examples):
 - sustained write-latency breach (p99 above threshold for N consecutive heartbeats)
 - reconnect storms above a defined cap
 - corrupted/truncated capture files detected by a verifier tool (if you introduce a binary format)
-
-On fatal exit, write forensic artifacts (paths and filenames must be stable and documented):
-- a JSON summary of counters and failure reason
-- a bounded missing-token dump (if relevant)
-- a bounded sample of recent frames/messages (if relevant)
 
 Do not hide failure behind “tainted” state for Phase 1 capture. The run must fail.
 

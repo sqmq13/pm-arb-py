@@ -1,16 +1,18 @@
 [
   {
-    "type": "book",
+    "event_type": "book",
     "asset_id": "tokenA",
-    "ts": 3000,
+    "timestamp": 3000,
+    "bids": [],
     "asks": [{"price": "0.40", "size": "50"}],
     "extra": "foo",
     "meta": {"bar": 1}
   },
   {
-    "type": "book",
+    "event_type": "book",
     "asset_id": "tokenB",
-    "ts": 3000,
+    "timestamp": 3000,
+    "bids": [],
     "asks": [{"price": "0.40", "size": "50"}],
     "extra": "foo"
   }

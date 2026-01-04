@@ -1,26 +1,30 @@
 [
   {
-    "type": "book",
+    "event_type": "book",
     "asset_id": "tokenA",
-    "ts": 1000,
+    "timestamp": 1000,
+    "bids": [],
     "asks": [{"price": "0.45", "size": "100"}]
   },
   {
-    "type": "book",
+    "event_type": "book",
     "asset_id": "tokenB",
-    "ts": 1000,
+    "timestamp": 1000,
+    "bids": [],
     "asks": [{"price": "0.45", "size": "100"}]
   },
   {
-    "type": "book",
+    "event_type": "book",
     "asset_id": "tokenA",
-    "ts": 2000,
+    "timestamp": 2000,
+    "bids": [],
     "asks": [{"price": "0.60", "size": "100"}]
   },
   {
-    "type": "book",
+    "event_type": "book",
     "asset_id": "tokenB",
-    "ts": 2000,
+    "timestamp": 2000,
+    "bids": [],
     "asks": [{"price": "0.60", "size": "100"}]
   }
 ]

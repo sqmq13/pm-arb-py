@@ -112,8 +112,11 @@ def _append_sample(samples: deque[int], value: int, max_samples: int) -> None:
         samples.popleft()
 
 
-def _quantile_from_samples(samples: deque[int], percentile: float) -> int:
-    return quantile(list(samples), percentile)
+def _quantile_from_samples(samples: Iterable[int], percentile: float) -> int:
+    values = [value for value in samples if value > 0]
+    if not values:
+        return 0
+    return quantile(values, percentile)
 
 
 def _config_snapshot(config: Config) -> dict[str, Any]:
@@ -200,23 +203,47 @@ def _iter_items(payload: Any) -> Iterable[dict[str, Any]]:
         yield payload
 
 
+def _get_token_id(item: dict[str, Any]) -> str | None:
+    token_id = item.get("asset_id")
+    if token_id is None:
+        token_id = item.get("token_id") or item.get("tokenId") or item.get("assetId")
+    if token_id is None:
+        return None
+    return str(token_id)
+
+
+def _get_msg_type(item: dict[str, Any]) -> str:
+    msg_type = item.get("type")
+    if isinstance(msg_type, str):
+        return msg_type.lower()
+    msg_type = item.get("event_type")
+    if isinstance(msg_type, str):
+        return msg_type.lower()
+    if "bids" in item or "asks" in item:
+        return "book"
+    if "price_changes" in item:
+        return "price_change"
+    return "unknown"
+
+
 def _extract_minimal_fields(payload: Any) -> tuple[list[tuple[str, str]], dict[str, int]]:
     token_pairs: list[tuple[str, str]] = []
     msg_type_counts: dict[str, int] = {}
     for item in _iter_items(payload):
-        token_id = item.get("asset_id") or item.get("token_id") or item.get("tokenId")
+        msg_type = _get_msg_type(item)
+        msg_type_counts[msg_type] = msg_type_counts.get(msg_type, 0) + 1
+        token_id = _get_token_id(item)
         if token_id is not None:
-            token_id = str(token_id)
-        msg_type = item.get("type")
-        if isinstance(msg_type, str):
-            lowered = msg_type.lower()
-            msg_type_counts[lowered] = msg_type_counts.get(lowered, 0) + 1
-            if token_id is not None:
-                token_pairs.append((token_id, lowered))
-        else:
-            msg_type_counts["unknown"] = msg_type_counts.get("unknown", 0) + 1
-            if token_id is not None:
-                token_pairs.append((token_id, "unknown"))
+            token_pairs.append((token_id, msg_type))
+        price_changes = item.get("price_changes")
+        if isinstance(price_changes, list):
+            for change in price_changes:
+                if not isinstance(change, dict):
+                    continue
+                change_token_id = _get_token_id(change)
+                if change_token_id is None:
+                    continue
+                token_pairs.append((change_token_id, msg_type))
     return token_pairs, msg_type_counts
 
 
@@ -445,15 +472,15 @@ async def _heartbeat_loop(state: CaptureState) -> None:
             "bytes_written": global_bytes,
             "msgs_per_sec": global_frames / max(elapsed_ns / 1_000_000_000.0, 1e-9),
             "bytes_per_sec": global_bytes / max(elapsed_ns / 1_000_000_000.0, 1e-9),
-            "write_ns_p50": quantile(global_write_samples, 50),
-            "write_ns_p95": quantile(global_write_samples, 95),
-            "write_ns_p99": quantile(global_write_samples, 99),
-            "ingest_ns_p50": quantile(global_ingest_samples, 50),
-            "ingest_ns_p95": quantile(global_ingest_samples, 95),
-            "ingest_ns_p99": quantile(global_ingest_samples, 99),
-            "backpressure_ns_p50": quantile(global_backpressure_samples, 50),
-            "backpressure_ns_p95": quantile(global_backpressure_samples, 95),
-            "backpressure_ns_p99": quantile(global_backpressure_samples, 99),
+            "write_ns_p50": _quantile_from_samples(global_write_samples, 50),
+            "write_ns_p95": _quantile_from_samples(global_write_samples, 95),
+            "write_ns_p99": _quantile_from_samples(global_write_samples, 99),
+            "ingest_ns_p50": _quantile_from_samples(global_ingest_samples, 50),
+            "ingest_ns_p95": _quantile_from_samples(global_ingest_samples, 95),
+            "ingest_ns_p99": _quantile_from_samples(global_ingest_samples, 99),
+            "backpressure_ns_p50": _quantile_from_samples(global_backpressure_samples, 50),
+            "backpressure_ns_p95": _quantile_from_samples(global_backpressure_samples, 95),
+            "backpressure_ns_p99": _quantile_from_samples(global_backpressure_samples, 99),
             "coverage_pct": global_coverage_pct,
             "token_ids_seen": len(global_tokens_seen),
             "token_ids_assigned": len(state.pinned_tokens),
@@ -558,6 +585,28 @@ async def _run_shard(state: CaptureState, shard: ShardState) -> None:
                 confirm_start = time.monotonic()
                 confirm_deadline = confirm_start + state.config.ws_confirm_timeout_seconds
 
+                async def _check_confirm_deadline(now: float) -> None:
+                    if shard.confirmed or now < confirm_deadline:
+                        return
+                    shard.confirm_failures += 1
+                    _write_runlog(
+                        run_dir,
+                        {
+                            "record_type": "subscribe_confirm_fail",
+                            "run_id": state.run.run_id,
+                            "shard_id": shard.shard_id,
+                            "variant": variant,
+                            "tokens_seen": len(confirm_tokens),
+                        },
+                    )
+                    if shard.confirm_failures >= state.config.ws_confirm_max_failures:
+                        await _trigger_fatal(
+                            state,
+                            FATAL_SUBSCRIBE_CONFIRM,
+                            "subscription confirmation failed",
+                        )
+                    raise TimeoutError("subscribe confirmation timeout")
+
                 for group_index, token_group in enumerate(shard.groups):
                     payload = build_subscribe_payload(variant, token_group)
                     payload_bytes = orjson.dumps(payload)
@@ -576,31 +625,15 @@ async def _run_shard(state: CaptureState, shard: ShardState) -> None:
                     )
 
                 while not state.fatal_event.is_set():
+                    await _check_confirm_deadline(time.monotonic())
                     try:
                         raw = await asyncio.wait_for(ws.recv(), timeout=1.0)
                     except asyncio.TimeoutError:
-                        if not shard.confirmed and time.monotonic() >= confirm_deadline:
-                            shard.confirm_failures += 1
-                            _write_runlog(
-                                run_dir,
-                                {
-                                    "record_type": "subscribe_confirm_fail",
-                                    "run_id": state.run.run_id,
-                                    "shard_id": shard.shard_id,
-                                    "variant": variant,
-                                    "tokens_seen": len(confirm_tokens),
-                                },
-                            )
-                            if shard.confirm_failures >= state.config.ws_confirm_max_failures:
-                                await _trigger_fatal(
-                                    state,
-                                    FATAL_SUBSCRIBE_CONFIRM,
-                                    "subscription confirmation failed",
-                                )
-                            raise TimeoutError("subscribe confirmation timeout")
+                        await _check_confirm_deadline(time.monotonic())
                         continue
 
                     rx_mono_ns = time.monotonic_ns()
+                    await _check_confirm_deadline(time.monotonic())
                     payload_bytes, flags = _payload_bytes(raw)
                     write_start_ns = time.monotonic_ns()
                     record = append_record(
@@ -651,7 +684,7 @@ async def _run_shard(state: CaptureState, shard: ShardState) -> None:
                         shard.last_seen[token_id] = rx_mono_ns
                     if not shard.confirmed:
                         for token_id, msg_type in token_pairs:
-                            if msg_type == "book":
+                            if msg_type in {"book", "price_change"}:
                                 confirm_tokens.add(token_id)
                         if shard.token_ids:
                             confirm_pct = 100.0 * len(confirm_tokens) / len(shard.token_ids)

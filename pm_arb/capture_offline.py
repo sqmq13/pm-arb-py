@@ -98,18 +98,47 @@ def _iter_items(frame: Any) -> Iterable[dict[str, Any]]:
         yield frame
 
 
+def _get_token_id(item: dict[str, Any]) -> str | None:
+    token_id = item.get("asset_id")
+    if token_id is None:
+        token_id = item.get("token_id") or item.get("tokenId") or item.get("assetId")
+    if token_id is None:
+        return None
+    return str(token_id)
+
+
+def _get_msg_type(item: dict[str, Any]) -> str:
+    msg_type = item.get("event_type")
+    if isinstance(msg_type, str):
+        return msg_type.lower()
+    msg_type = item.get("type")
+    if isinstance(msg_type, str):
+        return msg_type.lower()
+    if "bids" in item or "asks" in item:
+        return "book"
+    if "price_changes" in item:
+        return "price_change"
+    return "unknown"
+
+
 def _extract_minimal_fields(frame: Any) -> tuple[list[str], list[str]]:
     token_ids: list[str] = []
     msg_types: list[str] = []
     for item in _iter_items(frame):
-        token_id = item.get("asset_id") or item.get("token_id") or item.get("tokenId")
+        msg_type = _get_msg_type(item)
+        msg_types.append(msg_type)
+        token_id = _get_token_id(item)
         if token_id is not None:
-            token_ids.append(str(token_id))
-        msg_type = item.get("type")
-        if isinstance(msg_type, str):
-            msg_types.append(msg_type)
-        else:
-            msg_types.append("unknown")
+            token_ids.append(token_id)
+        price_changes = item.get("price_changes")
+        if isinstance(price_changes, list):
+            for change in price_changes:
+                if not isinstance(change, dict):
+                    continue
+                change_token_id = _get_token_id(change)
+                if change_token_id is None:
+                    continue
+                token_ids.append(change_token_id)
     return token_ids, msg_types
 
 
