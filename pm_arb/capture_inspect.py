@@ -46,7 +46,7 @@ def inspect_run(run_dir: Path) -> InspectSummary:
     for idx_path in idx_paths:
         shard_name = idx_path.stem
         frames_path = idx_path.with_suffix(".frames")
-        idx_records = read_idx(idx_path)
+        idx_records = read_idx(idx_path, frames_path=frames_path)
         frames_bytes = frames_path.stat().st_size if frames_path.exists() else 0
         idx_bytes = idx_path.stat().st_size
         total_records += len(idx_records)
@@ -54,6 +54,8 @@ def inspect_run(run_dir: Path) -> InspectSummary:
         total_idx_bytes += idx_bytes
         first_rx = idx_records[0].rx_mono_ns if idx_records else None
         last_rx = idx_records[-1].rx_mono_ns if idx_records else None
+        first_wall = idx_records[0].rx_wall_ns_utc if idx_records else None
+        last_wall = idx_records[-1].rx_wall_ns_utc if idx_records else None
         shard_summaries[shard_name] = {
             "frames_path": str(frames_path),
             "idx_path": str(idx_path),
@@ -62,6 +64,8 @@ def inspect_run(run_dir: Path) -> InspectSummary:
             "idx_bytes": idx_bytes,
             "rx_mono_ns_first": first_rx,
             "rx_mono_ns_last": last_rx,
+            "rx_wall_ns_utc_first": first_wall,
+            "rx_wall_ns_utc_last": last_wall,
         }
 
     metrics_dir = run_dir / "metrics"

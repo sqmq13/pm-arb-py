@@ -8,11 +8,12 @@ from pathlib import Path
 from typing import Any
 
 from .capture_format import (
-    FRAMES_HEADER_LEN,
-    FRAMES_HEADER_STRUCT,
-    FRAMES_MAGIC,
     append_record,
+    frames_header_len,
+    frames_header_struct,
+    frames_magic,
     read_idx,
+    _schema_from_magic,
 )
 
 
@@ -118,7 +119,7 @@ def slice_run(
     total_records = 0
     for idx_path in idx_paths:
         frames_path = idx_path.with_suffix(".frames")
-        entries = read_idx(idx_path)
+        entries = read_idx(idx_path, frames_path=frames_path)
         selected = _select_entries(
             entries,
             start_mono_ns=start_mono_ns,
@@ -135,18 +136,39 @@ def slice_run(
         ) as out_frames_fh, out_idx_path.open("ab") as out_idx_fh:
             for entry in selected:
                 frames_fh.seek(entry.offset_frames)
-                header = frames_fh.read(FRAMES_HEADER_LEN)
-                if len(header) != FRAMES_HEADER_LEN:
+                magic = frames_fh.read(8)
+                if len(magic) != 8:
                     raise ValueError("truncated frames header")
-                magic, schema_version, flags, rx_mono_ns, payload_len, payload_crc32 = (
-                    FRAMES_HEADER_STRUCT.unpack(header)
-                )
-                if magic != FRAMES_MAGIC:
+                schema_version = _schema_from_magic(magic)
+                header_len = frames_header_len(schema_version)
+                header_bytes = magic + frames_fh.read(header_len - 8)
+                if len(header_bytes) != header_len:
+                    raise ValueError("truncated frames header")
+                header_struct = frames_header_struct(schema_version)
+                if schema_version == 1:
+                    magic, schema_field, flags, rx_mono_ns, payload_len, payload_crc32 = (
+                        header_struct.unpack(header_bytes)
+                    )
+                    rx_wall_ns_utc = 0
+                else:
+                    (
+                        magic,
+                        schema_field,
+                        flags,
+                        rx_mono_ns,
+                        rx_wall_ns_utc,
+                        payload_len,
+                        payload_crc32,
+                    ) = header_struct.unpack(header_bytes)
+                if magic != frames_magic(schema_version):
                     raise ValueError("bad frames magic")
+                if schema_field != schema_version:
+                    raise ValueError("schema version mismatch")
                 if (
                     payload_len != entry.payload_len
                     or payload_crc32 != entry.payload_crc32
                     or rx_mono_ns != entry.rx_mono_ns
+                    or rx_wall_ns_utc != entry.rx_wall_ns_utc
                 ):
                     raise ValueError("idx/frames mismatch")
                 payload = frames_fh.read(payload_len)
@@ -157,6 +179,7 @@ def slice_run(
                     out_idx_fh,
                     payload,
                     rx_mono_ns,
+                    rx_wall_ns_utc,
                     flags=flags,
                     schema_version=schema_version,
                 )

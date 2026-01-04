@@ -76,6 +76,14 @@ class Config:
     ws_confirm_max_failures: int = 3
     ws_reconnect_max: int = 10
     ws_reconnect_backoff_seconds: float = 1.0
+    capture_frames_schema_version: int = 2
+    capture_use_market_filters: bool = False
+    capture_max_markets: int = 5000
+    capture_confirm_tokens_per_shard: int = 25
+    capture_confirm_timeout_seconds: float = 45.0
+    capture_confirm_min_events: int = 1
+    capture_activity_gates_enable: bool = False
+    capture_backpressure_fatal_ms: float = 250.0
     coverage_warmup_seconds: float = 60.0
     coverage_warmup_global_pct: float = 99.0
     coverage_warmup_shard_pct: float = 98.0
@@ -128,4 +136,9 @@ class Config:
             else:
                 value = raw
             setattr(cfg, field.name, value)
+        if "capture_max_markets" not in cli_overrides and (
+            ENV_PREFIX + "CAPTURE_MAX_MARKETS"
+        ) not in env:
+            if "max_markets" in cli_overrides or (ENV_PREFIX + "MAX_MARKETS") in env:
+                cfg.capture_max_markets = cfg.max_markets
         return cfg

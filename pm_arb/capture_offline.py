@@ -10,10 +10,9 @@ from typing import Any, Iterable
 
 from .capture import RunBootstrap, _append_ndjson, bootstrap_run
 from .capture_format import (
-    FRAMES_HEADER_LEN,
-    FRAMES_SCHEMA_VERSION,
-    IDX_ENTRY_LEN,
     append_record,
+    frames_header_len,
+    idx_entry_len,
 )
 from .config import Config
 
@@ -40,13 +39,15 @@ class CaptureStats:
     def record(
         self,
         payload_len: int,
+        header_len: int,
+        idx_len: int,
         write_duration_ns: int,
         ingest_latency_ns: int,
         token_ids: Iterable[str],
         msg_types: Iterable[str],
     ) -> None:
         self.frames += 1
-        self.bytes_written += payload_len + FRAMES_HEADER_LEN + IDX_ENTRY_LEN
+        self.bytes_written += payload_len + header_len + idx_len
         self.write_durations_ns.append(write_duration_ns)
         self.ingest_latencies_ns.append(ingest_latency_ns)
         for token_id in token_ids:
@@ -217,13 +218,17 @@ def run_capture_offline(
     run_id: str | None = None,
     *,
     emit_metrics: bool = True,
+    multiplier: int = 1,
 ) -> CaptureRunResult:
+    if multiplier < 1:
+        raise ValueError("multiplier must be >= 1")
     pinned_tokens = _load_pinned_tokens(fixtures_dir)
     manifest_extra = {
-        "capture_schema_version": FRAMES_SCHEMA_VERSION,
+        "capture_schema_version": config.capture_frames_schema_version,
         "payload_source": PAYLOAD_SOURCE,
         "payload_encoder": PAYLOAD_ENCODER,
         "fixtures_dir": str(fixtures_dir),
+        "fixtures_multiplier": multiplier,
         "pinned_token_ids": sorted(pinned_tokens),
     }
     run = bootstrap_run(config, run_id=run_id, manifest_extra=manifest_extra)
@@ -237,31 +242,42 @@ def run_capture_offline(
     next_heartbeat_ns = start_mono_ns + 1_000_000_000
 
     with frames_path.open("ab") as frames_fh, idx_path.open("ab") as idx_fh:
-        for frame in _iter_frames_from_fixture(fixtures_dir):
-            payload_text = json.dumps(frame, ensure_ascii=True, separators=(",", ":"))
-            payload_bytes = payload_text.encode("utf-8")
-            rx_mono_ns = time.monotonic_ns()
-            write_start_ns = time.monotonic_ns()
-            append_record(frames_fh, idx_fh, payload_bytes, rx_mono_ns)
-            write_end_ns = time.monotonic_ns()
-            write_duration_ns = write_end_ns - write_start_ns
-            ingest_latency_ns = write_end_ns - rx_mono_ns
-            token_ids, msg_types = _extract_minimal_fields(frame)
-            stats.record(
-                len(payload_bytes),
-                write_duration_ns,
-                ingest_latency_ns,
-                token_ids,
-                msg_types,
-            )
-            now_ns = write_end_ns
-            if emit_metrics and now_ns >= next_heartbeat_ns:
-                hb_wall_ns_utc = time.time_ns()
-                _write_heartbeat(run_dir, run.run_id, hb_wall_ns_utc, now_ns)
-                elapsed_ns = now_ns - start_mono_ns
-                _write_metrics(metrics_global, run.run_id, None, stats, elapsed_ns, pinned_tokens)
-                _write_metrics(metrics_shard, run.run_id, 0, stats, elapsed_ns, pinned_tokens)
-                next_heartbeat_ns = now_ns + 1_000_000_000
+        for _ in range(multiplier):
+            for frame in _iter_frames_from_fixture(fixtures_dir):
+                payload_text = json.dumps(frame, ensure_ascii=True, separators=(",", ":"))
+                payload_bytes = payload_text.encode("utf-8")
+                rx_mono_ns = time.monotonic_ns()
+                rx_wall_ns_utc = run.t0_wall_ns_utc + (rx_mono_ns - run.t0_mono_ns)
+                write_start_ns = time.monotonic_ns()
+                record = append_record(
+                    frames_fh,
+                    idx_fh,
+                    payload_bytes,
+                    rx_mono_ns,
+                    rx_wall_ns_utc,
+                    schema_version=config.capture_frames_schema_version,
+                )
+                write_end_ns = time.monotonic_ns()
+                write_duration_ns = write_end_ns - write_start_ns
+                ingest_latency_ns = write_end_ns - rx_mono_ns
+                token_ids, msg_types = _extract_minimal_fields(frame)
+                stats.record(
+                    len(payload_bytes),
+                    frames_header_len(record.schema_version),
+                    idx_entry_len(record.schema_version),
+                    write_duration_ns,
+                    ingest_latency_ns,
+                    token_ids,
+                    msg_types,
+                )
+                now_ns = write_end_ns
+                if emit_metrics and now_ns >= next_heartbeat_ns:
+                    hb_wall_ns_utc = time.time_ns()
+                    _write_heartbeat(run_dir, run.run_id, hb_wall_ns_utc, now_ns)
+                    elapsed_ns = now_ns - start_mono_ns
+                    _write_metrics(metrics_global, run.run_id, None, stats, elapsed_ns, pinned_tokens)
+                    _write_metrics(metrics_shard, run.run_id, 0, stats, elapsed_ns, pinned_tokens)
+                    next_heartbeat_ns = now_ns + 1_000_000_000
         frames_fh.flush()
         idx_fh.flush()
         os.fsync(frames_fh.fileno())

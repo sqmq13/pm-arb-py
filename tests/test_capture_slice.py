@@ -17,7 +17,7 @@ def test_capture_slice_offset_window(tmp_path: Path) -> None:
     run_dir = result.run.run_dir
 
     idx_path = run_dir / "capture" / "shard_00.idx"
-    entries = read_idx(idx_path)
+    entries = read_idx(idx_path, frames_path=run_dir / "capture" / "shard_00.frames")
     assert len(entries) >= 5
     start_offset = entries[2].offset_frames
     end_offset = entries[4].offset_frames

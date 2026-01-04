@@ -20,3 +20,6 @@ def test_capture_inspect_summary(tmp_path: Path) -> None:
     assert payload["shards"]["count"] == 1
     assert payload["shards"]["records"] == result.stats.frames
     assert payload["metrics"]["global"]["count"] >= 1
+    shard = payload["shards"]["by_shard"]["shard_00"]
+    assert shard["rx_wall_ns_utc_first"] is not None
+    assert shard["rx_wall_ns_utc_last"] is not None

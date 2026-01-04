@@ -28,6 +28,7 @@ from .capture_format import verify_frames
 from .capture_slice import slice_run
 from .engine import Engine
 from .gamma import fetch_markets, parse_clob_token_ids
+from .market_select import select_active_binary_markets
 from .reconcile import Reconciler
 from .report import generate_report
 from .sweep import sweep_cost
@@ -267,6 +268,7 @@ def main(argv: list[str] | None = None) -> int:
 
     discover = subparsers.add_parser("discover", parents=[common])
     discover.add_argument("--only-matching", action="store_true", default=False)
+    discover.add_argument("--universe", default=None, choices=["active-binary"])
 
     capture = subparsers.add_parser("capture", parents=[common])
     capture.add_argument("--run-id", default=None)
@@ -282,6 +284,7 @@ def main(argv: list[str] | None = None) -> int:
     capture_bench = subparsers.add_parser("capture-bench", parents=[common])
     capture_bench.add_argument("--run-id", default=None)
     capture_bench.add_argument("--fixtures-dir", default="testdata/fixtures")
+    capture_bench.add_argument("--multiplier", type=int, default=1)
 
     capture_inspect = subparsers.add_parser("capture-inspect", parents=[common])
     capture_inspect.add_argument("--run-dir", required=True)
@@ -314,6 +317,21 @@ def main(argv: list[str] | None = None) -> int:
             return contract_test_offline(config, Path(args.fixtures_dir))
         return contract_test_online(config)
     if args.command == "discover":
+        if args.universe == "active-binary":
+            markets = fetch_markets(
+                config.gamma_base_url,
+                config.rest_timeout,
+                limit=config.gamma_limit,
+                max_markets=config.capture_max_markets,
+            )
+            candidates = select_active_binary_markets(
+                markets, max_markets=config.capture_max_markets
+            )
+            for market in candidates:
+                slug = market.get("slug", "")
+                question = market.get("question", "")
+                print(f"{market.get('id','unknown')}\tuniverse\t{slug}\t{question}")
+            return 0
         engine = Engine(config)
         candidates = engine.discover()
         for market in candidates:
@@ -373,7 +391,12 @@ def main(argv: list[str] | None = None) -> int:
         if not config.offline:
             print("capture-bench requires --offline", file=sys.stderr)
             return 2
-        result = run_capture_offline(config, Path(args.fixtures_dir), run_id=args.run_id)
+        result = run_capture_offline(
+            config,
+            Path(args.fixtures_dir),
+            run_id=args.run_id,
+            multiplier=args.multiplier,
+        )
         elapsed_sec = max(result.elapsed_ns / 1_000_000_000.0, 1e-9)
         summary = {
             "run_id": result.run.run_id,
