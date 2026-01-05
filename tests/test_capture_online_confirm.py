@@ -1,4 +1,5 @@
 import asyncio
+import json
 import time
 from collections import deque
 
@@ -13,8 +14,10 @@ from pm_arb.capture_online import (
     UniverseState,
     _check_backpressure_fatal,
     _confirm_event_from_payload,
+    _handle_confirm_deadline_miss,
     _handle_payload,
     _heartbeat_loop,
+    _mark_reconnecting,
 )
 from pm_arb.config import Config
 
@@ -143,3 +146,159 @@ async def test_backpressure_fatal_emits_missing_tokens(tmp_path, monkeypatch):
     missing_path = run_dir / "missing_tokens.json"
     assert state.fatal_event.is_set()
     assert missing_path.exists()
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_does_not_fatal_on_expired_confirm_deadline(tmp_path, monkeypatch):
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / "metrics").mkdir()
+    (run_dir / "capture").mkdir()
+    run = RunBootstrap("run", run_dir, 0, 0)
+    config = Config(capture_heartbeat_interval_seconds=0.01)
+    frames_path = run_dir / "capture" / "shard_00.frames"
+    idx_path = run_dir / "capture" / "shard_00.idx"
+    shard = ShardState(
+        shard_id=0,
+        token_ids=["t1"],
+        groups=[],
+        frames_path=frames_path,
+        idx_path=idx_path,
+        frames_fh=frames_path.open("ab"),
+        idx_fh=idx_path.open("ab"),
+        ring=deque(maxlen=5),
+        confirmed=False,
+    )
+    shard.confirm_deadline_mono_ns = monotonic_ns() - 1_000_000
+    universe = UniverseState(
+        universe_version=1,
+        current_token_ids={"t1"},
+        current_market_ids=set(),
+        token_added_mono_ns={},
+        shard_targets={},
+    )
+    state = CaptureState(
+        run=run,
+        config=config,
+        shards=[shard],
+        pinned_tokens=["t1"],
+        universe=universe,
+    )
+
+    def fake_write_metrics(path, record):
+        state.fatal_event.set()
+
+    def fail_trigger(*args, **kwargs):
+        raise AssertionError("unexpected fatal trigger")
+
+    monkeypatch.setattr("pm_arb.capture_online._write_metrics", fake_write_metrics)
+    monkeypatch.setattr("pm_arb.capture_online._trigger_fatal", fail_trigger)
+
+    await _heartbeat_loop(state)
+
+    shard.frames_fh.close()
+    shard.idx_fh.close()
+
+
+@pytest.mark.asyncio
+async def test_confirm_failures_fatal_after_threshold(tmp_path):
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / "metrics").mkdir()
+    (run_dir / "capture").mkdir()
+    run = RunBootstrap("run", run_dir, 0, 0)
+    config = Config(
+        capture_confirm_max_failures=2,
+        capture_confirm_timeout_seconds=5.0,
+    )
+    frames_path = run_dir / "capture" / "shard_00.frames"
+    idx_path = run_dir / "capture" / "shard_00.idx"
+    shard = ShardState(
+        shard_id=0,
+        token_ids=["t1"],
+        groups=[],
+        frames_path=frames_path,
+        idx_path=idx_path,
+        frames_fh=frames_path.open("ab"),
+        idx_fh=idx_path.open("ab"),
+        ring=deque(maxlen=5),
+        confirmed=False,
+    )
+    shard.confirm_deadline_mono_ns = monotonic_ns() - 1
+    shard.last_subscribe_variant = "A"
+    shard.last_subscribe_group_index = 0
+    universe = UniverseState(
+        universe_version=1,
+        current_token_ids={"t1"},
+        current_market_ids=set(),
+        token_added_mono_ns={},
+        shard_targets={},
+    )
+    state = CaptureState(
+        run=run,
+        config=config,
+        shards=[shard],
+        pinned_tokens=["t1"],
+        universe=universe,
+    )
+
+    for _ in range(config.capture_confirm_max_failures):
+        with pytest.raises(TimeoutError):
+            await _handle_confirm_deadline_miss(
+                state,
+                shard,
+                variant="A",
+                now_ns=monotonic_ns(),
+            )
+        assert not state.fatal_event.is_set()
+
+    with pytest.raises(TimeoutError):
+        await _handle_confirm_deadline_miss(
+            state,
+            shard,
+            variant="A",
+            now_ns=monotonic_ns(),
+        )
+
+    fatal_path = run_dir / "fatal.json"
+    assert state.fatal_event.is_set()
+    assert fatal_path.exists()
+    fatal = json.loads(fatal_path.read_text(encoding="utf-8"))
+    assert fatal["fatal_reason"] == "SUBSCRIBE_CONFIRM_FAIL"
+    assert "shard_id=0" in fatal["fatal_message"]
+    assert "variant=A" in fatal["fatal_message"]
+    assert "group_index=0" in fatal["fatal_message"]
+
+    shard.frames_fh.close()
+    shard.idx_fh.close()
+
+
+def test_reconnect_clears_confirm_deadline(tmp_path):
+    frames_path = tmp_path / "shard_00.frames"
+    idx_path = tmp_path / "shard_00.idx"
+    shard = ShardState(
+        shard_id=0,
+        token_ids=["t1"],
+        groups=[],
+        frames_path=frames_path,
+        idx_path=idx_path,
+        frames_fh=frames_path.open("ab"),
+        idx_fh=idx_path.open("ab"),
+        ring=deque(maxlen=1),
+        confirmed=True,
+        confirm_events_seen=5,
+    )
+    shard.confirm_deadline_mono_ns = monotonic_ns() - 1
+    shard.last_subscribe_variant = "B"
+    shard.last_subscribe_group_index = 2
+
+    _mark_reconnecting(shard)
+
+    assert shard.confirmed is False
+    assert shard.confirm_events_seen == 0
+    assert shard.confirm_deadline_mono_ns is None
+    assert shard.last_subscribe_variant is None
+    assert shard.last_subscribe_group_index is None
+
+    shard.frames_fh.close()
+    shard.idx_fh.close()

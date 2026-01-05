@@ -115,6 +115,8 @@ class ShardState:
     confirm_events_seen: int = 0
     confirm_deadline_mono_ns: int | None = None
     target: ShardTarget | None = None
+    last_subscribe_variant: str | None = None
+    last_subscribe_group_index: int | None = None
 
 
 @dataclass
@@ -162,6 +164,14 @@ def _quantile_from_samples(samples: Iterable[int], percentile: float) -> int:
     if not values:
         return 0
     return quantile(values, percentile)
+
+
+def _mark_reconnecting(shard: ShardState) -> None:
+    shard.confirmed = False
+    shard.confirm_events_seen = 0
+    shard.confirm_deadline_mono_ns = None
+    shard.last_subscribe_variant = None
+    shard.last_subscribe_group_index = None
 
 
 def _apply_churn_guard_policy(
@@ -796,6 +806,59 @@ def _all_shards_confirmed(state: CaptureState) -> bool:
     return all(shard.confirmed for shard in state.shards)
 
 
+def _confirm_failure_message(shard: ShardState, config: Config) -> str:
+    variant = shard.last_subscribe_variant or "unknown"
+    group_index = (
+        "unknown"
+        if shard.last_subscribe_group_index is None
+        else str(shard.last_subscribe_group_index)
+    )
+    return (
+        "confirmation deadline exceeded "
+        f"shard_id={shard.shard_id} "
+        f"failures={shard.confirm_failures} "
+        f"timeout_seconds={config.capture_confirm_timeout_seconds} "
+        f"variant={variant} "
+        f"group_index={group_index}"
+    )
+
+
+async def _handle_confirm_deadline_miss(
+    state: CaptureState,
+    shard: ShardState,
+    *,
+    variant: str,
+    now_ns: int,
+) -> None:
+    shard.confirm_failures += 1
+    _write_runlog(
+        state.run.run_dir,
+        {
+            "record_type": "subscribe_confirm_fail",
+            "run_id": state.run.run_id,
+            "shard_id": shard.shard_id,
+            "variant": variant,
+            "confirm_events_seen": shard.confirm_events_seen,
+        },
+    )
+    if shard.confirm_failures > state.config.capture_confirm_max_failures:
+        message = _confirm_failure_message(shard, state.config)
+        missing = _build_missing_tokens_dump(
+            state,
+            FATAL_SUBSCRIBE_CONFIRM,
+            now_ns,
+            include_missing_list=False,
+            window_ns=None,
+        )
+        await _trigger_fatal(
+            state,
+            FATAL_SUBSCRIBE_CONFIRM,
+            message,
+            missing_tokens=missing,
+        )
+    raise TimeoutError("subscribe confirmation timeout")
+
+
 async def _check_backpressure_fatal(
     state: CaptureState,
     now_ns: int,
@@ -900,6 +963,7 @@ async def _heartbeat_loop(state: CaptureState) -> None:
         global_msg_type_counts: dict[str, int] = {}
         global_reconnects = 0
         global_confirm_failures = 0
+        global_unconfirmed_count = 0
         global_tokens_seen: set[str] = set()
         global_coverage_pct = 0.0
 
@@ -910,6 +974,8 @@ async def _heartbeat_loop(state: CaptureState) -> None:
             global_decode_errors += shard_stats.decode_errors
             global_reconnects += shard.reconnects
             global_confirm_failures += shard.confirm_failures
+            if shard.confirm_deadline_mono_ns is not None and not shard.confirmed:
+                global_unconfirmed_count += 1
             global_tokens_seen.update(shard_stats.token_ids)
             global_write_samples.extend(shard_stats.write_durations_ns)
             global_ingest_samples.extend(shard_stats.ingest_latencies_ns)
@@ -925,6 +991,12 @@ async def _heartbeat_loop(state: CaptureState) -> None:
                 token_added_mono_ns=state.universe.token_added_mono_ns,
                 grace_ns=grace_ns,
             )
+            if shard.confirm_deadline_mono_ns is None:
+                deadline_remaining_ms = -1
+            else:
+                deadline_remaining_ms = int(
+                    (shard.confirm_deadline_mono_ns - now_ns) / 1_000_000
+                )
             shard_record = {
                 "record_type": "heartbeat",
                 "run_id": state.run.run_id,
@@ -959,6 +1031,7 @@ async def _heartbeat_loop(state: CaptureState) -> None:
                 "reconnects": shard.reconnects,
                 "confirm_failures": shard.confirm_failures,
                 "confirmed": shard.confirmed,
+                "confirm_deadline_remaining_ms": deadline_remaining_ms,
                 "confirm_events_seen": shard.confirm_events_seen,
                 "decode_errors": shard_stats.decode_errors,
                 "msg_type_counts": shard_stats.msg_type_counts,
@@ -1002,6 +1075,8 @@ async def _heartbeat_loop(state: CaptureState) -> None:
             "token_ids_assigned": len(state.pinned_tokens),
             "reconnects": global_reconnects,
             "confirm_failures": global_confirm_failures,
+            "confirm_failures_total": global_confirm_failures,
+            "shards_unconfirmed_count": global_unconfirmed_count,
             "decode_errors": global_decode_errors,
             "msg_type_counts": global_msg_type_counts,
             "universe_version": state.universe.universe_version,
@@ -1036,28 +1111,6 @@ async def _heartbeat_loop(state: CaptureState) -> None:
                     f"free disk below {state.config.min_free_disk_gb} GB",
                 )
                 break
-
-        deadline_exceeded = any(
-            shard.confirm_deadline_mono_ns is not None
-            and now_ns > shard.confirm_deadline_mono_ns
-            and not shard.confirmed
-            for shard in state.shards
-        )
-        if deadline_exceeded:
-            missing = _build_missing_tokens_dump(
-                state,
-                FATAL_SUBSCRIBE_CONFIRM,
-                now_ns,
-                include_missing_list=False,
-                window_ns=None,
-            )
-            await _trigger_fatal(
-                state,
-                FATAL_SUBSCRIBE_CONFIRM,
-                "confirmation deadline exceeded",
-                missing_tokens=missing,
-            )
-            break
 
         next_tick = now_ns + interval_ns
 
@@ -1168,9 +1221,7 @@ def _apply_shard_refresh(state: CaptureState, shard: ShardState) -> bool:
     shard.token_ids = list(target.token_ids)
     shard.groups = list(target.groups)
     shard.confirm_token_ids = list(target.confirm_token_ids)
-    shard.confirmed = False
-    shard.confirm_events_seen = 0
-    shard.confirm_deadline_mono_ns = None
+    _mark_reconnecting(shard)
     target.refresh_requested.clear()
     _write_runlog(
         state.run.run_dir,
@@ -1398,8 +1449,7 @@ async def _run_shard(state: CaptureState, shard: ShardState) -> None:
         refresh_applied = False
         try:
             async with websockets.connect(state.config.clob_ws_url) as ws:
-                shard.confirmed = False
-                shard.confirm_events_seen = 0
+                _mark_reconnecting(shard)
                 shard.confirm_deadline_mono_ns = (
                     monotonic_ns()
                     + int(state.config.capture_confirm_timeout_seconds * 1_000_000_000)
@@ -1410,28 +1460,18 @@ async def _run_shard(state: CaptureState, shard: ShardState) -> None:
                         return
                     if now_ns < shard.confirm_deadline_mono_ns:
                         return
-                    shard.confirm_failures += 1
-                    _write_runlog(
-                        run_dir,
-                        {
-                            "record_type": "subscribe_confirm_fail",
-                            "run_id": state.run.run_id,
-                            "shard_id": shard.shard_id,
-                            "variant": variant,
-                            "confirm_events_seen": shard.confirm_events_seen,
-                        },
+                    await _handle_confirm_deadline_miss(
+                        state,
+                        shard,
+                        variant=variant,
+                        now_ns=now_ns,
                     )
-                    if shard.confirm_failures >= state.config.capture_confirm_max_failures:
-                        await _trigger_fatal(
-                            state,
-                            FATAL_SUBSCRIBE_CONFIRM,
-                            "subscription confirmation failed",
-                        )
-                    raise TimeoutError("subscribe confirmation timeout")
 
                 for group_index, token_group in enumerate(shard.groups):
                     payload = build_subscribe_payload(variant, token_group)
                     payload_bytes = orjson.dumps(payload)
+                    shard.last_subscribe_variant = variant
+                    shard.last_subscribe_group_index = group_index
                     await ws.send(payload_bytes.decode("utf-8"))
                     _write_runlog(
                         run_dir,
@@ -1471,6 +1511,7 @@ async def _run_shard(state: CaptureState, shard: ShardState) -> None:
             if refresh_applied:
                 continue
         except Exception as exc:
+            _mark_reconnecting(shard)
             shard.reconnects += 1
             _write_runlog(
                 run_dir,
