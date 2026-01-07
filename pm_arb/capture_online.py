@@ -9,6 +9,7 @@ import shutil
 import socket
 import struct
 import time
+from datetime import datetime, timezone
 from math import gcd
 from collections import deque
 from dataclasses import asdict, dataclass, field, fields
@@ -31,6 +32,12 @@ from .capture_format import (
 from .capture_offline import quantile
 from .clob_ws import build_subscribe_payload
 from .config import Config
+from .fees import (
+    FeeRateClient,
+    FeeRegimeMonitor,
+    FeeRegimeState,
+    parse_expected_fee_rate_bps_values,
+)
 from .gamma import (
     UniverseSnapshot,
     compute_desired_universe,
@@ -38,6 +45,8 @@ from .gamma import (
     parse_clob_token_ids,
     select_active_binary_markets,
 )
+from .policy import PolicySelector, parse_policy_rules, policy_counts
+from .segments import SegmentTag, build_segment_maps
 
 SUBSCRIBE_VARIANTS = ("A", "B", "C")
 
@@ -134,10 +143,21 @@ class UniverseState:
     refresh_churn_pct_last: float = 0.0
     refresh_churn_guard_count: int = 0
     refresh_skipped_delta_below_min_count: int = 0
-    refresh_last_decision_reason: str = "SKIPPED_NO_CHANGE"
+    refresh_last_decision_reason: str = "SKIPPED_DELTA_BELOW_MIN"
     tokens_added_last: int = 0
     tokens_removed_last: int = 0
     shards_refreshed_last: int = 0
+    expected_churn_last: bool = False
+    expected_churn_reason_last: str = "UNKNOWN"
+    expected_churn_rollover_hit_last: bool = False
+    expected_churn_expiry_hit_last: bool = False
+    segment_by_token_id: dict[str, SegmentTag] = field(default_factory=dict)
+    segment_by_market_id: dict[str, SegmentTag] = field(default_factory=dict)
+    policy_counts_last: dict[str, int] = field(default_factory=dict)
+    fee_regime_state: str = "OK"
+    fee_regime_reason: str | None = None
+    fee_regime_sampled_tokens_count: int = 0
+    fee_rate_unknown_count_last: int = 0
 
 
 @dataclass
@@ -147,6 +167,9 @@ class CaptureState:
     shards: list[ShardState]
     pinned_tokens: list[str]
     universe: UniverseState
+    fee_rate_client: FeeRateClient | None = None
+    policy_selector: PolicySelector | None = None
+    fee_regime_monitor: FeeRegimeMonitor | None = None
     backpressure_breach_count: int = 0
     fatal_event: asyncio.Event = field(default_factory=asyncio.Event)
     fatal_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
@@ -191,6 +214,139 @@ def _apply_churn_guard_policy(
     return baseline_interval, 0, False
 
 
+@dataclass(frozen=True)
+class ExpectedChurnSummary:
+    expected_churn: bool
+    reason: str
+    rollover_window_hit: bool
+    expiry_window_hit: bool
+    expected_count: int
+    total_count: int
+
+
+def _cadence_window_seconds(config: Config, cadence_bucket: str) -> float:
+    if cadence_bucket == "5m":
+        return config.capture_expected_churn_window_seconds_5m
+    if cadence_bucket == "15m":
+        return config.capture_expected_churn_window_seconds_15m
+    if cadence_bucket == "30m":
+        return config.capture_expected_churn_window_seconds_30m
+    if cadence_bucket == "60m":
+        return config.capture_expected_churn_window_seconds_60m
+    return 0.0
+
+
+def _is_within_cadence_window(
+    now_utc: datetime,
+    cadence_bucket: str,
+    window_seconds: float,
+) -> bool:
+    if window_seconds <= 0:
+        return False
+    interval_seconds = {
+        "5m": 300,
+        "15m": 900,
+        "30m": 1800,
+        "60m": 3600,
+    }.get(cadence_bucket)
+    if interval_seconds is None:
+        return False
+    seconds_since_hour = (
+        now_utc.minute * 60
+        + now_utc.second
+        + (now_utc.microsecond / 1_000_000.0)
+    )
+    offset = seconds_since_hour % interval_seconds
+    distance = min(offset, interval_seconds - offset)
+    return distance <= window_seconds
+
+
+def _classify_expected_churn(
+    now_utc: datetime,
+    segment: SegmentTag,
+    config: Config,
+) -> tuple[bool, str, bool, bool]:
+    expiry_window_ns = int(config.capture_expected_churn_expiry_window_seconds * 1_000_000_000)
+    end_ns = segment.end_wall_ns_utc
+    if end_ns is not None and expiry_window_ns > 0:
+        now_ns = int(now_utc.timestamp() * 1_000_000_000)
+        if abs(now_ns - end_ns) <= expiry_window_ns:
+            return True, "EXPECTED_EXPIRY", False, True
+    cadence_bucket = segment.cadence_bucket
+    window_seconds = _cadence_window_seconds(config, cadence_bucket)
+    if cadence_bucket != "unknown" and _is_within_cadence_window(
+        now_utc, cadence_bucket, window_seconds
+    ):
+        reason = "EXPECTED_ROLLOVER_1H" if cadence_bucket == "60m" else "EXPECTED_ROLLOVER_15M"
+        return True, reason, True, False
+    return False, "UNKNOWN", False, False
+
+
+def _expected_churn_for_refresh(
+    now_wall_ns_utc: int,
+    removed_market_ids: set[str],
+    added_market_ids: set[str],
+    current_segments: dict[str, SegmentTag],
+    next_segments: dict[str, SegmentTag],
+    config: Config,
+) -> ExpectedChurnSummary:
+    if not config.capture_expected_churn_enable:
+        return ExpectedChurnSummary(
+            expected_churn=False,
+            reason="UNKNOWN",
+            rollover_window_hit=False,
+            expiry_window_hit=False,
+            expected_count=0,
+            total_count=0,
+        )
+    now_utc = datetime.fromtimestamp(now_wall_ns_utc / 1_000_000_000, tz=timezone.utc)
+    expected_count = 0
+    total_count = 0
+    reasons: dict[str, int] = {}
+    rollover_hit = False
+    expiry_hit = False
+    for market_id in removed_market_ids:
+        segment = current_segments.get(str(market_id))
+        if segment is None:
+            continue
+        expected, reason, roll_hit, exp_hit = _classify_expected_churn(
+            now_utc, segment, config
+        )
+        total_count += 1
+        if expected:
+            expected_count += 1
+            reasons[reason] = reasons.get(reason, 0) + 1
+        rollover_hit = rollover_hit or roll_hit
+        expiry_hit = expiry_hit or exp_hit
+    for market_id in added_market_ids:
+        segment = next_segments.get(str(market_id))
+        if segment is None:
+            continue
+        expected, reason, roll_hit, exp_hit = _classify_expected_churn(
+            now_utc, segment, config
+        )
+        total_count += 1
+        if expected:
+            expected_count += 1
+            reasons[reason] = reasons.get(reason, 0) + 1
+        rollover_hit = rollover_hit or roll_hit
+        expiry_hit = expiry_hit or exp_hit
+    expected_churn = False
+    if total_count > 0:
+        expected_churn = (expected_count / total_count) >= config.capture_expected_churn_min_ratio
+    reason = "UNKNOWN"
+    if expected_churn and reasons:
+        reason = max(reasons.items(), key=lambda item: (item[1], item[0]))[0]
+    return ExpectedChurnSummary(
+        expected_churn=expected_churn,
+        reason=reason,
+        rollover_window_hit=rollover_hit,
+        expiry_window_hit=expiry_hit,
+        expected_count=expected_count,
+        total_count=total_count,
+    )
+
+
 def _monotonic_precision_stats(sample_count: int) -> dict[str, Any]:
     if sample_count < 2:
         raise ValueError("sample_count must be >= 2")
@@ -232,6 +388,12 @@ def _config_snapshot(config: Config) -> dict[str, Any]:
     return snapshot
 
 
+def _snapshot_for_manifest(snapshot: UniverseSnapshot) -> dict[str, Any]:
+    payload = asdict(snapshot)
+    payload.pop("selected_markets", None)
+    return payload
+
+
 def _read_git_commit() -> str:
     git_dir = Path.cwd() / ".git"
     head_path = git_dir / "HEAD"
@@ -252,6 +414,77 @@ def _environment_metadata() -> dict[str, str]:
         "platform": platform.platform(),
         "hostname": socket.gethostname(),
     }
+
+
+def _build_fee_rate_client(config: Config) -> FeeRateClient:
+    return FeeRateClient(
+        base_url=config.fee_rate_base_url,
+        timeout_seconds=config.fee_rate_timeout_seconds,
+        cache_ttl_seconds=config.fee_rate_cache_ttl_seconds,
+        max_in_flight=config.fee_rate_max_in_flight,
+    )
+
+
+def _build_policy_selector(config: Config) -> PolicySelector:
+    policy_map = parse_policy_rules(config.policy_rules_json, config.policy_default_id)
+    return PolicySelector(policy_map)
+
+
+def _build_fee_regime_monitor(config: Config) -> FeeRegimeMonitor:
+    expected_values = parse_expected_fee_rate_bps_values(
+        config.fee_regime_expected_fee_rate_bps_values
+    )
+    return FeeRegimeMonitor(
+        expect_15m_crypto_fee_enabled=config.fee_regime_expect_15m_crypto_fee_enabled,
+        expect_other_fee_free=config.fee_regime_expect_other_fee_free,
+        expect_unknown_fee_free=config.fee_regime_expect_unknown_fee_free,
+        expected_fee_rate_bps_values=expected_values,
+    )
+
+
+def _parse_canary_tokens(raw: str) -> list[str]:
+    if not raw:
+        return []
+    return [token.strip() for token in raw.split(",") if token.strip()]
+
+
+def _segment_policy_summary(
+    selector: PolicySelector,
+    segments_by_token_id: dict[str, SegmentTag],
+) -> list[dict[str, Any]]:
+    grouped: dict[tuple[Any, ...], dict[str, Any]] = {}
+    for segment in segments_by_token_id.values():
+        segment_key = (
+            segment.cadence_bucket,
+            segment.is_crypto,
+            segment.fee_enabled,
+            segment.fee_rate_known,
+        )
+        policy_id = selector.select(segment)
+        group_key = (segment_key, policy_id)
+        entry = grouped.get(group_key)
+        if entry is None:
+            entry = {
+                "segment_key": {
+                    "cadence_bucket": segment.cadence_bucket,
+                    "is_crypto": segment.is_crypto,
+                    "fee_enabled": segment.fee_enabled,
+                    "fee_rate_known": segment.fee_rate_known,
+                },
+                "policy_id": policy_id,
+                "token_count": 0,
+            }
+            grouped[group_key] = entry
+        entry["token_count"] += 1
+    ordered = sorted(
+        grouped.values(),
+        key=lambda item: (
+            item["policy_id"],
+            str(item["segment_key"]["cadence_bucket"]),
+            str(item["segment_key"]["is_crypto"]),
+        ),
+    )
+    return ordered
 
 
 def _stable_hash(token_id: str) -> int:
@@ -541,6 +774,7 @@ def _snapshot_from_selected_markets(
             "max_markets": config.capture_max_markets,
             "filters_enabled": False,
         },
+        selected_markets=selected_markets,
     )
 
 
@@ -550,16 +784,19 @@ def _load_startup_universe(
     snapshot = compute_desired_universe(config, universe_version=1)
     pinned_tokens = list(snapshot.token_ids)
     universe_mode = "active-binary"
-    markets = fetch_markets(
-        config.gamma_base_url,
-        config.rest_timeout,
-        limit=config.gamma_limit,
-        max_markets=config.capture_max_markets,
-    )
-    selected_markets = select_active_binary_markets(
-        markets,
-        max_markets=config.capture_max_markets,
-    )
+    if snapshot.selected_markets is not None:
+        selected_markets = list(snapshot.selected_markets)
+    else:
+        markets = fetch_markets(
+            config.gamma_base_url,
+            config.rest_timeout,
+            limit=config.gamma_limit,
+            max_markets=config.capture_max_markets,
+        )
+        selected_markets = select_active_binary_markets(
+            markets,
+            max_markets=config.capture_max_markets,
+        )
     market_by_id = {
         str(market["id"]): market
         for market in selected_markets
@@ -1051,6 +1288,9 @@ async def _heartbeat_loop(state: CaptureState) -> None:
                 grace_ns=grace_ns,
             )
 
+        fee_rate_stats = (
+            state.fee_rate_client.stats_snapshot() if state.fee_rate_client else {}
+        )
         global_record = {
             "record_type": "heartbeat",
             "run_id": state.run.run_id,
@@ -1089,6 +1329,17 @@ async def _heartbeat_loop(state: CaptureState) -> None:
             "refresh_interval_seconds_current": state.universe.effective_refresh_interval_seconds,
             "refresh_skipped_delta_below_min_count": state.universe.refresh_skipped_delta_below_min_count,
             "refresh_last_decision_reason": state.universe.refresh_last_decision_reason,
+            "expected_churn_bool": state.universe.expected_churn_last,
+            "expected_churn_reason": state.universe.expected_churn_reason_last,
+            "rollover_window_hit": state.universe.expected_churn_rollover_hit_last,
+            "expiry_window_hit": state.universe.expected_churn_expiry_hit_last,
+            "fee_rate_cache_hits": fee_rate_stats.get("cache_hits", 0),
+            "fee_rate_cache_misses": fee_rate_stats.get("cache_misses", 0),
+            "fee_rate_unknown_count": state.universe.fee_rate_unknown_count_last,
+            "fee_regime_state": state.universe.fee_regime_state,
+            "circuit_breaker_reason": state.universe.fee_regime_reason,
+            "sampled_tokens_count": state.universe.fee_regime_sampled_tokens_count,
+            "policy_counts": state.universe.policy_counts_last,
         }
         _write_metrics(metrics_global, global_record)
         state.heartbeat_samples.append(global_record)
@@ -1261,6 +1512,13 @@ async def _refresh_loop(state: CaptureState) -> None:
     if state.universe.effective_refresh_interval_seconds <= 0:
         state.universe.effective_refresh_interval_seconds = baseline_interval
     run_dir = state.run.run_dir
+    if state.fee_rate_client is None:
+        state.fee_rate_client = _build_fee_rate_client(config)
+    if state.policy_selector is None:
+        state.policy_selector = _build_policy_selector(config)
+    if state.fee_regime_monitor is None:
+        state.fee_regime_monitor = _build_fee_regime_monitor(config)
+    canary_tokens = _parse_canary_tokens(config.fee_regime_canary_token_ids)
     while not state.fatal_event.is_set() and not state.universe.refresh_cancelled:
         await asyncio.sleep(state.universe.effective_refresh_interval_seconds)
         if state.fatal_event.is_set() or state.universe.refresh_cancelled:
@@ -1271,14 +1529,91 @@ async def _refresh_loop(state: CaptureState) -> None:
                 universe_version=state.universe.universe_version + 1,
             )
             desired_tokens = set(snapshot.token_ids)
+            desired_market_ids = {str(market_id) for market_id in snapshot.market_ids}
             added, removed = _compute_refresh_delta(
                 state.universe.current_token_ids, desired_tokens
             )
+            added_markets = desired_market_ids - state.universe.current_market_ids
+            removed_markets = state.universe.current_market_ids - desired_market_ids
             delta_count = len(added) + len(removed)
             churn_pct = 100.0 * delta_count / max(1, len(state.universe.current_token_ids))
             state.universe.refresh_churn_pct_last = churn_pct
             state.universe.tokens_added_last = len(added)
             state.universe.tokens_removed_last = len(removed)
+
+            selected_markets = snapshot.selected_markets
+            if selected_markets is None:
+                selected_markets = select_active_binary_markets(
+                    fetch_markets(
+                        config.gamma_base_url,
+                        config.rest_timeout,
+                        limit=config.gamma_limit,
+                        max_markets=config.capture_max_markets,
+                    ),
+                    max_markets=config.capture_max_markets,
+                )
+            fee_rate_client = state.fee_rate_client
+            policy_selector = state.policy_selector
+            fee_regime_monitor = state.fee_regime_monitor
+            fee_results: dict[str, Any] = {}
+            sample_tokens: list[str] = []
+            fee_regime_state = FeeRegimeState(
+                state="OK",
+                reason="DISABLED",
+                sampled_tokens_count=0,
+                unknown_fee_count=0,
+                observed_fee_rates=[],
+            )
+            if config.fee_rate_enable and fee_rate_client and fee_regime_monitor:
+                sample_tokens = fee_regime_monitor.sample_tokens(
+                    desired_tokens,
+                    run_id=state.run.run_id,
+                    universe_version=snapshot.universe_version,
+                    sample_size=config.fee_regime_sample_size_per_cycle,
+                    canary_token_ids=canary_tokens,
+                )
+                await fee_rate_client.prefetch_fee_rates(
+                    sample_tokens,
+                    timeout_seconds=config.fee_rate_refresh_timeout_seconds,
+                    max_tokens=config.fee_rate_prefetch_max_tokens,
+                )
+                fee_results = fee_rate_client.cached_fee_rates(desired_tokens)
+
+            next_segment_by_token, next_segment_by_market = build_segment_maps(
+                list(selected_markets),
+                fee_results_by_token=fee_results,
+            )
+            if config.fee_rate_enable and fee_regime_monitor:
+                fee_regime_state = fee_regime_monitor.evaluate(
+                    next_segment_by_token,
+                    token_ids_sampled=sample_tokens,
+                )
+            state.universe.fee_regime_state = fee_regime_state.state
+            state.universe.fee_regime_reason = fee_regime_state.reason
+            state.universe.fee_regime_sampled_tokens_count = (
+                fee_regime_state.sampled_tokens_count
+            )
+            state.universe.fee_rate_unknown_count_last = (
+                fee_regime_state.unknown_fee_count
+            )
+
+            expected_summary = _expected_churn_for_refresh(
+                time.time_ns(),
+                removed_markets,
+                added_markets,
+                state.universe.segment_by_market_id,
+                next_segment_by_market,
+                config,
+            )
+            state.universe.expected_churn_last = expected_summary.expected_churn
+            state.universe.expected_churn_reason_last = expected_summary.reason
+            state.universe.expected_churn_rollover_hit_last = (
+                expected_summary.rollover_window_hit
+            )
+            state.universe.expected_churn_expiry_hit_last = (
+                expected_summary.expiry_window_hit
+            )
+
             if not _should_apply_refresh(
                 added,
                 removed,
@@ -1286,14 +1621,15 @@ async def _refresh_loop(state: CaptureState) -> None:
             ):
                 state.universe.refresh_skipped_delta_below_min_count += 1
                 state.universe.shards_refreshed_last = 0
-                if delta_count == 0:
-                    state.universe.refresh_last_decision_reason = "SKIPPED_NO_CHANGE"
-                else:
-                    state.universe.refresh_last_decision_reason = "SKIPPED_BELOW_MIN"
+                state.universe.refresh_last_decision_reason = "SKIPPED_DELTA_BELOW_MIN"
                 continue
             guard_triggered = (
                 churn_pct > config.capture_universe_refresh_max_churn_pct
             )
+            bypass_guard = guard_triggered and expected_summary.expected_churn
+            if bypass_guard:
+                state.universe.refresh_last_decision_reason = "BYPASSED_EXPECTED_CHURN"
+                guard_triggered = False
             (
                 next_interval,
                 next_guard_count,
@@ -1334,18 +1670,9 @@ async def _refresh_loop(state: CaptureState) -> None:
                     )
                     break
                 continue
-            state.universe.refresh_churn_guard_count = 0
-            state.universe.refresh_last_decision_reason = "APPLIED"
+            if not bypass_guard:
+                state.universe.refresh_last_decision_reason = "APPLIED"
 
-            selected_markets = select_active_binary_markets(
-                fetch_markets(
-                    config.gamma_base_url,
-                    config.rest_timeout,
-                    limit=config.gamma_limit,
-                    max_markets=config.capture_max_markets,
-                ),
-                max_markets=config.capture_max_markets,
-            )
             scores = _token_score_map(selected_markets)
             ordered_tokens = _sorted_unique_tokens(snapshot.token_ids)
             next_targets = _build_shard_targets(
@@ -1378,7 +1705,13 @@ async def _refresh_loop(state: CaptureState) -> None:
             state.universe.refresh_count += 1
             state.universe.shards_refreshed_last = len(changed_targets)
             state.universe.current_token_ids = desired_tokens
-            state.universe.current_market_ids = set(snapshot.market_ids)
+            state.universe.current_market_ids = desired_market_ids
+            state.universe.segment_by_token_id = next_segment_by_token
+            state.universe.segment_by_market_id = next_segment_by_market
+            if policy_selector is not None:
+                state.universe.policy_counts_last = policy_counts(
+                    policy_selector, next_segment_by_token
+                )
             now_ns = monotonic_ns()
             for token_id in added:
                 state.universe.token_added_mono_ns[token_id] = now_ns
@@ -1552,6 +1885,22 @@ async def _capture_online_async(config: Config, run_id: str | None = None) -> in
         target_version=initial_snapshot.universe_version,
         scores=scores,
     )
+    fee_rate_client = _build_fee_rate_client(config) if config.fee_rate_enable else None
+    policy_selector = _build_policy_selector(config)
+    fee_regime_monitor = _build_fee_regime_monitor(config)
+    fee_results = (
+        fee_rate_client.cached_fee_rates(pinned_tokens) if fee_rate_client else {}
+    )
+    segment_by_token, segment_by_market = build_segment_maps(
+        selected_markets,
+        fee_results_by_token=fee_results,
+    )
+    policy_counts_initial = policy_counts(policy_selector, segment_by_token)
+    policy_summary_initial = _segment_policy_summary(policy_selector, segment_by_token)
+    canary_tokens = _parse_canary_tokens(config.fee_regime_canary_token_ids)
+    expected_fee_rate_values = sorted(
+        parse_expected_fee_rate_bps_values(config.fee_regime_expected_fee_rate_bps_values)
+    )
 
     manifest_extra = {
         "capture_schema_version": config.capture_frames_schema_version,
@@ -1564,7 +1913,29 @@ async def _capture_online_async(config: Config, run_id: str | None = None) -> in
         "config": _config_snapshot(config),
         "pinned_tokens": pinned_tokens,
         "pinned_markets": pinned_markets,
-        "initial_universe": asdict(initial_snapshot),
+        "segment_metadata": {
+            "schema_version": 1,
+            "by_token_id": {
+                token_id: tag.to_dict() for token_id, tag in segment_by_token.items()
+            },
+            "by_market_id": {
+                market_id: tag.to_dict() for market_id, tag in segment_by_market.items()
+            },
+        },
+        "policy_map": policy_selector.policy_map.to_dict(),
+        "policy_assignments": {
+            "by_policy_id": policy_counts_initial,
+            "by_segment": policy_summary_initial,
+        },
+        "fee_regime": {
+            "expect_15m_crypto_fee_enabled": config.fee_regime_expect_15m_crypto_fee_enabled,
+            "expect_other_fee_free": config.fee_regime_expect_other_fee_free,
+            "expect_unknown_fee_free": config.fee_regime_expect_unknown_fee_free,
+            "sample_size_per_cycle": config.fee_regime_sample_size_per_cycle,
+            "canary_token_ids": canary_tokens,
+            "expected_fee_rate_bps_values": expected_fee_rate_values,
+        },
+        "initial_universe": _snapshot_for_manifest(initial_snapshot),
         "universe_refresh": {
             "enabled": config.capture_universe_refresh_enable,
             "interval_seconds": config.capture_universe_refresh_interval_seconds,
@@ -1638,6 +2009,9 @@ async def _capture_online_async(config: Config, run_id: str | None = None) -> in
         token_added_mono_ns=token_added_mono_ns,
         shard_targets=shard_targets,
         effective_refresh_interval_seconds=config.capture_universe_refresh_interval_seconds,
+        segment_by_token_id=segment_by_token,
+        segment_by_market_id=segment_by_market,
+        policy_counts_last=policy_counts_initial,
     )
     state = CaptureState(
         run=run,
@@ -1645,6 +2019,9 @@ async def _capture_online_async(config: Config, run_id: str | None = None) -> in
         shards=shards,
         pinned_tokens=pinned_tokens,
         universe=universe_state,
+        fee_rate_client=fee_rate_client,
+        policy_selector=policy_selector,
+        fee_regime_monitor=fee_regime_monitor,
     )
     _write_runlog(
         run_dir,

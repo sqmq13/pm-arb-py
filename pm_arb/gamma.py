@@ -19,6 +19,7 @@ class UniverseSnapshot:
     created_wall_ns_utc: int
     created_mono_ns: int
     selection: dict[str, Any]
+    selected_markets: list[dict[str, Any]] | None = None
 
 
 def parse_clob_token_ids(value: Any) -> list[str]:
@@ -124,6 +125,7 @@ def compute_desired_universe(
         created_wall_ns_utc=time.time_ns(),
         created_mono_ns=time.perf_counter_ns(),
         selection=selection,
+        selected_markets=selected_markets,
     )
 
 

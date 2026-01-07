@@ -12,4 +12,7 @@ __all__ = [
     "capture_format",
     "capture_inspect",
     "capture_slice",
+    "segments",
+    "fees",
+    "policy",
 ]

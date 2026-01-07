@@ -17,6 +17,9 @@ def test_phase1_allowlist() -> None:
         "capture_format",
         "capture_inspect",
         "capture_slice",
+        "fees",
+        "policy",
+        "segments",
     }
     banned = {
         "book",

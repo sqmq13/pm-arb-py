@@ -53,6 +53,7 @@ async def test_refresh_integration_changed_shard_and_grace(tmp_path, monkeypatch
         capture_universe_refresh_min_delta_tokens=1,
         capture_universe_refresh_grace_seconds=10.0,
         capture_universe_refresh_max_churn_pct=100.0,
+        fee_rate_enable=False,
     )
 
     initial_tokens = ["t1", "t2", "t3", "t4"]

@@ -1,6 +1,7 @@
 import asyncio
 import json
 from collections import deque
+from datetime import datetime, timezone
 
 import pytest
 
@@ -23,6 +24,7 @@ from pm_arb.capture_online import (
 )
 from pm_arb.config import Config
 from pm_arb.gamma import UniverseSnapshot
+from pm_arb.segments import build_segment_maps
 
 
 def test_refresh_delta_min_threshold():
@@ -171,6 +173,7 @@ async def test_refresh_noop_does_not_reconnect(tmp_path, monkeypatch):
         capture_universe_refresh_min_delta_tokens=1,
         capture_universe_refresh_stagger_seconds=0.0,
         capture_universe_refresh_max_churn_pct=100.0,
+        fee_rate_enable=False,
     )
     tokens = ["t1", "t2", "t3", "t4"]
     shard_targets = _build_shard_targets(tokens, config, target_version=1, scores={})
@@ -213,6 +216,7 @@ async def test_refresh_noop_does_not_reconnect(tmp_path, monkeypatch):
         created_wall_ns_utc=1,
         created_mono_ns=2,
         selection={"max_markets": 10, "filters_enabled": False},
+        selected_markets=[],
     )
 
     async def fake_sleep(_):
@@ -230,7 +234,7 @@ async def test_refresh_noop_does_not_reconnect(tmp_path, monkeypatch):
     assert state.universe.refresh_count == 0
     assert state.universe.universe_version == 1
     assert state.universe.shards_refreshed_last == 0
-    assert state.universe.refresh_last_decision_reason == "SKIPPED_NO_CHANGE"
+    assert state.universe.refresh_last_decision_reason == "SKIPPED_DELTA_BELOW_MIN"
     assert all(
         shard.target is not None and not shard.target.refresh_requested.is_set()
         for shard in shards
@@ -266,6 +270,7 @@ async def test_refresh_skip_below_min_updates_metrics(tmp_path, monkeypatch):
         capture_universe_refresh_stagger_seconds=0.0,
         capture_universe_refresh_max_churn_pct=100.0,
         capture_heartbeat_interval_seconds=0.01,
+        fee_rate_enable=False,
     )
     tokens = ["t1", "t2"]
     shard_targets = _build_shard_targets(tokens, config, target_version=1, scores={})
@@ -306,6 +311,7 @@ async def test_refresh_skip_below_min_updates_metrics(tmp_path, monkeypatch):
         created_wall_ns_utc=1,
         created_mono_ns=2,
         selection={"max_markets": 10, "filters_enabled": False},
+        selected_markets=[],
     )
 
     async def fake_sleep(_):
@@ -332,7 +338,108 @@ async def test_refresh_skip_below_min_updates_metrics(tmp_path, monkeypatch):
 
     record = captured["record"]
     assert record["refresh_skipped_delta_below_min_count"] == 1
-    assert record["refresh_last_decision_reason"] == "SKIPPED_BELOW_MIN"
+    assert record["refresh_last_decision_reason"] == "SKIPPED_DELTA_BELOW_MIN"
+    assert "expected_churn_bool" in record
+    assert "fee_regime_state" in record
+
+    shard.frames_fh.close()
+    shard.idx_fh.close()
+
+
+@pytest.mark.asyncio
+async def test_expected_churn_bypasses_guard(tmp_path, monkeypatch):
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / "metrics").mkdir()
+    (run_dir / "capture").mkdir()
+    run = RunBootstrap("run", run_dir, 0, 0)
+    config = Config(
+        ws_shards=1,
+        capture_universe_refresh_enable=True,
+        capture_universe_refresh_interval_seconds=0.01,
+        capture_universe_refresh_min_delta_tokens=1,
+        capture_universe_refresh_stagger_seconds=0.0,
+        capture_universe_refresh_max_churn_pct=1.0,
+        capture_expected_churn_window_seconds_15m=120.0,
+        fee_rate_enable=False,
+    )
+    tokens = ["t1", "t2"]
+    shard_targets = _build_shard_targets(tokens, config, target_version=1, scores={})
+    target = shard_targets[0]
+    frames_path = run_dir / "capture" / "shard_00.frames"
+    idx_path = run_dir / "capture" / "shard_00.idx"
+    shard = ShardState(
+        shard_id=0,
+        token_ids=target.token_ids,
+        groups=target.groups,
+        frames_path=frames_path,
+        idx_path=idx_path,
+        frames_fh=frames_path.open("ab"),
+        idx_fh=idx_path.open("ab"),
+        ring=deque(maxlen=8),
+        target=target,
+    )
+    current_market = {
+        "id": "m1",
+        "question": "BTC 15 minute price?",
+        "clobTokenIds": ["t1", "t2"],
+        "active": True,
+        "enableOrderBook": True,
+    }
+    segment_by_token, segment_by_market = build_segment_maps([current_market])
+    universe = UniverseState(
+        universe_version=1,
+        current_token_ids=set(tokens),
+        current_market_ids={"m1"},
+        token_added_mono_ns={},
+        shard_targets=shard_targets,
+        effective_refresh_interval_seconds=config.capture_universe_refresh_interval_seconds,
+        segment_by_token_id=segment_by_token,
+        segment_by_market_id=segment_by_market,
+    )
+    state = CaptureState(
+        run=run,
+        config=config,
+        shards=[shard],
+        pinned_tokens=list(tokens),
+        universe=universe,
+    )
+    new_market = {
+        "id": "m2",
+        "question": "ETH 15 minute price?",
+        "clobTokenIds": ["t3", "t4"],
+        "active": True,
+        "enableOrderBook": True,
+    }
+    snapshot = UniverseSnapshot(
+        universe_version=2,
+        market_ids=["m2"],
+        token_ids=["t3", "t4"],
+        created_wall_ns_utc=1,
+        created_mono_ns=2,
+        selection={"max_markets": 10, "filters_enabled": False},
+        selected_markets=[new_market],
+    )
+
+    async def fake_sleep(_):
+        return None
+
+    def fake_compute(_cfg, *, universe_version=0):
+        state.universe.refresh_cancelled = True
+        return snapshot
+
+    boundary = datetime(2024, 1, 1, 0, 15, 30, tzinfo=timezone.utc)
+    boundary_ns = int(boundary.timestamp() * 1_000_000_000)
+
+    monkeypatch.setattr("pm_arb.capture_online.asyncio.sleep", fake_sleep)
+    monkeypatch.setattr("pm_arb.capture_online.compute_desired_universe", fake_compute)
+    monkeypatch.setattr("pm_arb.capture_online.time.time_ns", lambda: boundary_ns)
+
+    await _refresh_loop(state)
+
+    assert state.universe.refresh_last_decision_reason == "BYPASSED_EXPECTED_CHURN"
+    assert state.universe.refresh_churn_guard_count == 0
+    assert state.universe.refresh_count == 1
 
     shard.frames_fh.close()
     shard.idx_fh.close()
