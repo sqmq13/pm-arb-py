@@ -49,6 +49,8 @@ def select_active_binary_markets(
     *,
     max_markets: int,
 ) -> list[dict[str, Any]]:
+    if max_markets is not None and max_markets <= 0:
+        max_markets = None
     selected: list[dict[str, Any]] = []
     enable_key = "enable" + "Order" + "Book"
     for market in markets:
@@ -63,7 +65,7 @@ def select_active_binary_markets(
         if len(token_ids) != 2:
             continue
         selected.append(market)
-        if len(selected) >= max_markets:
+        if max_markets is not None and len(selected) >= max_markets:
             break
     return selected
 
@@ -85,12 +87,16 @@ def compute_desired_universe(
     config,
     *,
     universe_version: int = 0,
+    session: requests.Session | None = None,
+    stats: dict[str, int] | None = None,
 ) -> UniverseSnapshot:
     markets = fetch_markets(
         config.gamma_base_url,
         config.rest_timeout,
         limit=config.gamma_limit,
         max_markets=config.capture_max_markets,
+        session=session,
+        stats=stats,
     )
     ordered_markets = _sort_markets_deterministic(markets)
     selected_markets = select_active_binary_markets(
@@ -136,10 +142,14 @@ def fetch_markets(
     max_markets: int | None = None,
     params_override: dict[str, Any] | None = None,
     session: requests.Session | None = None,
+    stats: dict[str, int] | None = None,
 ) -> list[dict[str, Any]]:
     url = f"{base_url.rstrip('/')}/markets"
     offset = 0
     markets: list[dict[str, Any]] = []
+    pages_fetched = 0
+    if max_markets is not None and max_markets <= 0:
+        max_markets = None
     created_session = False
     if session is None:
         session = requests.Session()
@@ -171,6 +181,10 @@ def fetch_markets(
             if not page:
                 break
             markets.extend(page)
+            pages_fetched += 1
+            if stats is not None:
+                stats["pages_fetched"] = pages_fetched
+                stats["markets_seen"] = len(markets)
             if max_markets is not None and len(markets) >= max_markets:
                 return markets[:max_markets]
             offset += limit

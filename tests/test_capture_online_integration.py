@@ -94,7 +94,7 @@ async def test_refresh_integration_changed_shard_and_grace(tmp_path, monkeypatch
     new_tokens = initial_tokens + ["t5"]
     calls = {"count": 0}
 
-    def fake_compute(_cfg, *, universe_version=0):
+    def fake_compute(_cfg, *, universe_version=0, **_kwargs):
         calls["count"] += 1
         return UniverseSnapshot(
             universe_version=universe_version,

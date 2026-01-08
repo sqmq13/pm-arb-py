@@ -30,6 +30,62 @@ def _read_ndjson(path: Path) -> list[dict[str, Any]]:
     return records
 
 
+def audit_heartbeat_gaps(
+    run_dir: Path,
+    *,
+    threshold_seconds: float = 2.0,
+    max_gaps: int = 5,
+) -> dict[str, Any]:
+    run_dir = run_dir.resolve()
+    runlog_path = run_dir / "runlog.ndjson"
+    if not runlog_path.exists():
+        raise FileNotFoundError(str(runlog_path))
+    hb_count = 0
+    prev_hb_mono_ns: int | None = None
+    between_types: dict[str, int] = {}
+    gaps: list[dict[str, Any]] = []
+    with runlog_path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            record = json.loads(line)
+            record_type = record.get("record_type")
+            if record_type == "heartbeat":
+                hb_count += 1
+                hb_mono_ns = record.get("hb_mono_ns")
+                if isinstance(hb_mono_ns, int) and prev_hb_mono_ns is not None:
+                    gap_seconds = (hb_mono_ns - prev_hb_mono_ns) / 1_000_000_000.0
+                    if gap_seconds > threshold_seconds:
+                        gaps.append(
+                            {
+                                "gap_seconds": gap_seconds,
+                                "from_hb_mono_ns": prev_hb_mono_ns,
+                                "to_hb_mono_ns": hb_mono_ns,
+                                "record_types_between": dict(
+                                    sorted(between_types.items())
+                                ),
+                            }
+                        )
+                if isinstance(hb_mono_ns, int):
+                    prev_hb_mono_ns = hb_mono_ns
+                between_types = {}
+                continue
+            if isinstance(record_type, str) and record_type:
+                between_types[record_type] = between_types.get(record_type, 0) + 1
+    gaps_sorted = sorted(gaps, key=lambda gap: gap["gap_seconds"], reverse=True)
+    max_gap = gaps_sorted[0] if gaps_sorted else None
+    return {
+        "run_dir": str(run_dir),
+        "threshold_seconds": threshold_seconds,
+        "hb_count": hb_count,
+        "gaps_over_threshold": len(gaps_sorted),
+        "max_gap_seconds": max_gap["gap_seconds"] if max_gap else 0.0,
+        "max_gap": max_gap,
+        "top_gaps": gaps_sorted[: max_gaps if max_gaps > 0 else len(gaps_sorted)],
+    }
+
+
 def inspect_run(run_dir: Path) -> InspectSummary:
     run_dir = run_dir.resolve()
     manifest_path = run_dir / "manifest.json"

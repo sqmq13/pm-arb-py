@@ -1,5 +1,7 @@
 import asyncio
+import contextlib
 import json
+import time
 from collections import deque
 from datetime import datetime, timezone
 
@@ -8,14 +10,17 @@ import pytest
 from pm_arb.capture import RunBootstrap
 from pm_arb.capture_online import (
     CaptureState,
+    RefreshPlan,
     ShardState,
     UniverseState,
     _apply_churn_guard_policy,
+    _build_shard_target_plans,
     _build_shard_targets,
     _compute_refresh_delta,
     _eligible_token_ids,
     _heartbeat_loop,
     _load_startup_universe,
+    _loop_lag_monitor,
     _refresh_loop,
     _select_changed_shards,
     _should_apply_refresh,
@@ -23,6 +28,7 @@ from pm_arb.capture_online import (
     split_subscribe_groups,
 )
 from pm_arb.config import Config
+from pm_arb.fees import FeeRegimeState
 from pm_arb.gamma import UniverseSnapshot
 from pm_arb.segments import build_segment_maps
 
@@ -136,7 +142,7 @@ def test_startup_selection_uses_snapshot(monkeypatch):
         selection={"max_markets": 10, "filters_enabled": False},
     )
 
-    def fake_compute(_cfg, *, universe_version=0):
+    def fake_compute(_cfg, *, universe_version=0, **_kwargs):
         assert universe_version == 1
         return snapshot
 
@@ -222,7 +228,7 @@ async def test_refresh_noop_does_not_reconnect(tmp_path, monkeypatch):
     async def fake_sleep(_):
         return None
 
-    def fake_compute(_cfg, *, universe_version=0):
+    def fake_compute(_cfg, *, universe_version=0, **_kwargs):
         state.universe.refresh_cancelled = True
         return snapshot
 
@@ -317,7 +323,7 @@ async def test_refresh_skip_below_min_updates_metrics(tmp_path, monkeypatch):
     async def fake_sleep(_):
         return None
 
-    def fake_compute(_cfg, *, universe_version=0):
+    def fake_compute(_cfg, *, universe_version=0, **_kwargs):
         state.universe.refresh_cancelled = True
         return snapshot
 
@@ -424,7 +430,7 @@ async def test_expected_churn_bypasses_guard(tmp_path, monkeypatch):
     async def fake_sleep(_):
         return None
 
-    def fake_compute(_cfg, *, universe_version=0):
+    def fake_compute(_cfg, *, universe_version=0, **_kwargs):
         state.universe.refresh_cancelled = True
         return snapshot
 
@@ -440,6 +446,161 @@ async def test_expected_churn_bypasses_guard(tmp_path, monkeypatch):
     assert state.universe.refresh_last_decision_reason == "BYPASSED_EXPECTED_CHURN"
     assert state.universe.refresh_churn_guard_count == 0
     assert state.universe.refresh_count == 1
+
+    shard.frames_fh.close()
+    shard.idx_fh.close()
+
+
+@pytest.mark.asyncio
+async def test_refresh_worker_does_not_block_heartbeat(tmp_path, monkeypatch):
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / "metrics").mkdir()
+    (run_dir / "capture").mkdir()
+    run = RunBootstrap("run", run_dir, 0, 0)
+    config = Config(
+        ws_shards=1,
+        capture_universe_refresh_enable=True,
+        capture_universe_refresh_interval_seconds=0.01,
+        capture_universe_refresh_timeout_seconds=1.0,
+        capture_universe_refresh_min_delta_tokens=1,
+        capture_universe_refresh_stagger_seconds=0.0,
+        capture_universe_refresh_max_churn_pct=100.0,
+        capture_heartbeat_interval_seconds=0.05,
+        fee_rate_enable=False,
+    )
+    tokens = ["t1", "t2"]
+    shard_targets = _build_shard_targets(tokens, config, target_version=1, scores={})
+    target = shard_targets[0]
+    frames_path = run_dir / "capture" / "shard_00.frames"
+    idx_path = run_dir / "capture" / "shard_00.idx"
+    shard = ShardState(
+        shard_id=0,
+        token_ids=target.token_ids,
+        groups=target.groups,
+        frames_path=frames_path,
+        idx_path=idx_path,
+        frames_fh=frames_path.open("ab"),
+        idx_fh=idx_path.open("ab"),
+        ring=deque(maxlen=8),
+        target=target,
+    )
+    universe = UniverseState(
+        universe_version=1,
+        current_token_ids=set(tokens),
+        current_market_ids={"m1"},
+        token_added_mono_ns={},
+        shard_targets=shard_targets,
+        effective_refresh_interval_seconds=config.capture_universe_refresh_interval_seconds,
+    )
+    state = CaptureState(
+        run=run,
+        config=config,
+        shards=[shard],
+        pinned_tokens=list(tokens),
+        universe=universe,
+    )
+    markets = [
+        {
+            "id": "m1",
+            "question": "Market 1?",
+            "clobTokenIds": ["t1", "t2"],
+            "active": True,
+            "enableOrderBook": True,
+        },
+        {
+            "id": "m2",
+            "question": "Market 2?",
+            "clobTokenIds": ["t3", "t4"],
+            "active": True,
+            "enableOrderBook": True,
+        },
+    ]
+    snapshot = UniverseSnapshot(
+        universe_version=2,
+        market_ids=["m1", "m2"],
+        token_ids=["t1", "t2", "t3", "t4"],
+        created_wall_ns_utc=1,
+        created_mono_ns=2,
+        selection={"max_markets": 10, "filters_enabled": False},
+        selected_markets=markets,
+    )
+
+    def heavy_compute(
+        config,
+        *,
+        universe_version=0,
+        run_id="run",
+        canary_tokens=None,
+        session=None,
+        loop=None,
+        fee_rate_client=None,
+        policy_selector=None,
+        fee_regime_monitor=None,
+        refresh_timeout_seconds=0.0,
+    ):
+        time.sleep(0.3)
+        _ = sum(idx * idx for idx in range(20000))
+        segment_by_token, segment_by_market = build_segment_maps(markets)
+        ordered_tokens = sorted(set(snapshot.token_ids))
+        shard_plans = _build_shard_target_plans(
+            ordered_tokens,
+            config,
+            target_version=universe_version,
+            scores={},
+        )
+        fee_regime_state = FeeRegimeState(
+            state="OK",
+            reason="DISABLED",
+            sampled_tokens_count=0,
+            unknown_fee_count=0,
+            observed_fee_rates=[],
+        )
+        return RefreshPlan(
+            snapshot=snapshot,
+            desired_token_ids=set(snapshot.token_ids),
+            desired_market_ids=set(snapshot.market_ids),
+            ordered_tokens=ordered_tokens,
+            shard_targets=shard_plans,
+            segment_by_token_id=segment_by_token,
+            segment_by_market_id=segment_by_market,
+            policy_counts={},
+            fee_regime_state=fee_regime_state,
+            fee_regime_sampled_tokens_count=0,
+            fee_rate_unknown_count=0,
+            gamma_pages_fetched=1,
+            markets_seen=len(markets),
+            tokens_selected=len(snapshot.token_ids),
+            worker_duration_ms=300.0,
+        )
+
+    monkeypatch.setattr("pm_arb.capture_online._compute_refresh_plan_sync", heavy_compute)
+
+    records: list[dict[str, float]] = []
+
+    def fake_write_metrics(path, record):
+        if path.name == "global.ndjson":
+            records.append(record)
+            if len(records) >= 6:
+                state.stop_event.set()
+
+    monkeypatch.setattr("pm_arb.capture_online._write_metrics", fake_write_metrics)
+
+    tasks = [
+        asyncio.create_task(_refresh_loop(state)),
+        asyncio.create_task(_loop_lag_monitor(state)),
+        asyncio.create_task(_heartbeat_loop(state)),
+    ]
+    await asyncio.wait_for(state.stop_event.wait(), timeout=2.0)
+    state.universe.refresh_cancelled = True
+    for task in tasks:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+    assert len(records) >= 5
+    max_lag = max(record["loop_lag_ms_max_last_interval"] for record in records)
+    assert max_lag < 100.0
 
     shard.frames_fh.close()
     shard.idx_fh.close()

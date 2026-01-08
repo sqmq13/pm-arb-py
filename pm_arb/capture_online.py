@@ -2,24 +2,31 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import hashlib
 import inspect
+import json
+import gc
 import os
 import platform
+import queue
 import shutil
 import signal
 import socket
 import struct
+import threading
 import time
 import warnings
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from datetime import datetime, timezone
-from math import gcd
+from math import gcd, ceil
 from collections import deque
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Any, Iterable
 
 import orjson
+import requests
 import websockets
 
 from .capture import RunBootstrap, _append_ndjson, _write_json, bootstrap_run, monotonic_ns
@@ -54,6 +61,344 @@ from .segments import SegmentTag, build_segment_maps
 SUBSCRIBE_VARIANTS = ("A", "B", "C")
 
 
+_IO_WRITER_STOP = object()
+_IO_WRITER: "_NdjsonWriter | None" = None
+_PARSE_WORKER_STOP = object()
+_FRAME_WRITE_STOP = object()
+
+
+@dataclass(frozen=True)
+class _ParseJob:
+    shard_id: int
+    payload_bytes: bytes
+    rx_mono_ns: int
+
+
+@dataclass(frozen=True)
+class _ParseResult:
+    shard_id: int
+    rx_mono_ns: int
+    token_ids: list[str]
+    msg_type_counts: dict[str, int]
+    decode_error: bool
+
+
+class _ParseWorker:
+    def __init__(
+        self,
+        *,
+        max_queue: int = 5000,
+        max_results: int = 5000,
+    ) -> None:
+        self._queue: queue.Queue[object] = queue.Queue(maxsize=max_queue)
+        self._results: queue.Queue[object] = queue.Queue(maxsize=max_results)
+        self._dropped = 0
+        self._results_dropped = 0
+        self._processed = 0
+        self._thread = threading.Thread(
+            target=self._run,
+            name="payload-parse",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def enqueue(self, job: _ParseJob) -> bool:
+        try:
+            self._queue.put_nowait(job)
+        except queue.Full:
+            self._dropped += 1
+            return False
+        return True
+
+    def get_nowait(self) -> _ParseResult | None:
+        try:
+            item = self._results.get_nowait()
+        except queue.Empty:
+            return None
+        if item is _PARSE_WORKER_STOP:
+            return None
+        return item
+
+    def close(self, timeout_seconds: float = 5.0) -> None:
+        with contextlib.suppress(queue.Full):
+            self._queue.put_nowait(_PARSE_WORKER_STOP)
+        self._thread.join(timeout=timeout_seconds)
+
+    def stats(self) -> dict[str, int]:
+        return {
+            "queue_size": self._queue.qsize(),
+            "results_size": self._results.qsize(),
+            "dropped": self._dropped,
+            "results_dropped": self._results_dropped,
+            "processed": self._processed,
+        }
+
+    def _run(self) -> None:
+        while True:
+            job = self._queue.get()
+            if job is _PARSE_WORKER_STOP:
+                with contextlib.suppress(queue.Full):
+                    self._results.put_nowait(_PARSE_WORKER_STOP)
+                break
+            assert isinstance(job, _ParseJob)
+            try:
+                payload = orjson.loads(job.payload_bytes)
+                token_pairs, msg_type_counts = _extract_minimal_fields(payload)
+                token_ids = [token_id for token_id, _ in token_pairs]
+                decode_error = False
+            except orjson.JSONDecodeError:
+                token_ids = []
+                msg_type_counts = {}
+                decode_error = True
+            result = _ParseResult(
+                shard_id=job.shard_id,
+                rx_mono_ns=job.rx_mono_ns,
+                token_ids=token_ids,
+                msg_type_counts=msg_type_counts,
+                decode_error=decode_error,
+            )
+            try:
+                self._results.put_nowait(result)
+                self._processed += 1
+            except queue.Full:
+                self._results_dropped += 1
+
+
+@dataclass(frozen=True)
+class _FrameWriteJob:
+    shard_id: int
+    payload_bytes: bytes
+    rx_mono_ns: int
+    rx_wall_ns_utc: int
+    flags: int
+
+
+@dataclass(frozen=True)
+class _FrameWriteResult:
+    shard_id: int
+    payload_bytes: bytes
+    header_bytes: bytes
+    schema_version: int
+    payload_len: int
+    write_duration_ns: int
+    ingest_latency_ns: int
+    backpressure_ns: int
+
+
+class _FrameWriter:
+    def __init__(
+        self,
+        *,
+        shards: list["ShardState"],
+        schema_version: int,
+        max_queue: int = 5000,
+        max_results: int = 5000,
+    ) -> None:
+        self._queue: queue.Queue[object] = queue.Queue(maxsize=max_queue)
+        self._results: queue.Queue[object] = queue.Queue(maxsize=max_results)
+        self._handles: dict[int, tuple[Any, Any]] = {
+            shard.shard_id: (shard.frames_fh, shard.idx_fh) for shard in shards
+        }
+        self._schema_version = schema_version
+        self._dropped = 0
+        self._results_dropped = 0
+        self._processed = 0
+        self._thread = threading.Thread(
+            target=self._run,
+            name="frame-writer",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def enqueue(self, job: _FrameWriteJob) -> bool:
+        try:
+            self._queue.put_nowait(job)
+        except queue.Full:
+            self._dropped += 1
+            return False
+        return True
+
+    def get_nowait(self) -> _FrameWriteResult | None:
+        try:
+            item = self._results.get_nowait()
+        except queue.Empty:
+            return None
+        if item is _FRAME_WRITE_STOP:
+            return None
+        return item
+
+    def close(self, timeout_seconds: float = 5.0) -> None:
+        try:
+            self._queue.put(_FRAME_WRITE_STOP, timeout=timeout_seconds)
+        except queue.Full:
+            return
+        self._thread.join(timeout=timeout_seconds)
+
+    def stats(self) -> dict[str, int]:
+        return {
+            "queue_size": self._queue.qsize(),
+            "results_size": self._results.qsize(),
+            "dropped": self._dropped,
+            "results_dropped": self._results_dropped,
+            "processed": self._processed,
+        }
+
+    def _run(self) -> None:
+        while True:
+            job = self._queue.get()
+            if job is _FRAME_WRITE_STOP:
+                with contextlib.suppress(queue.Full):
+                    self._results.put_nowait(_FRAME_WRITE_STOP)
+                break
+            assert isinstance(job, _FrameWriteJob)
+            handles = self._handles.get(job.shard_id)
+            if handles is None:
+                continue
+            frames_fh, idx_fh = handles
+            write_start_ns = monotonic_ns()
+            record = append_record(
+                frames_fh,
+                idx_fh,
+                job.payload_bytes,
+                job.rx_mono_ns,
+                job.rx_wall_ns_utc,
+                flags=job.flags,
+                schema_version=self._schema_version,
+            )
+            write_end_ns = monotonic_ns()
+            backpressure_ns = max(0, write_start_ns - job.rx_mono_ns)
+            ingest_latency_ns = write_end_ns - job.rx_mono_ns
+            header_struct = frames_header_struct(record.schema_version)
+            if record.schema_version == 1:
+                header_bytes = header_struct.pack(
+                    frames_magic(record.schema_version),
+                    record.schema_version,
+                    record.flags,
+                    record.rx_mono_ns,
+                    record.payload_len,
+                    record.payload_crc32,
+                )
+            else:
+                header_bytes = header_struct.pack(
+                    frames_magic(record.schema_version),
+                    record.schema_version,
+                    record.flags,
+                    record.rx_mono_ns,
+                    record.rx_wall_ns_utc,
+                    record.payload_len,
+                    record.payload_crc32,
+                )
+            result = _FrameWriteResult(
+                shard_id=job.shard_id,
+                payload_bytes=record.payload,
+                header_bytes=header_bytes,
+                schema_version=record.schema_version,
+                payload_len=record.payload_len,
+                write_duration_ns=write_end_ns - write_start_ns,
+                ingest_latency_ns=ingest_latency_ns,
+                backpressure_ns=backpressure_ns,
+            )
+            try:
+                self._results.put_nowait(result)
+                self._processed += 1
+            except queue.Full:
+                self._results_dropped += 1
+
+
+class _NdjsonWriter:
+    def __init__(
+        self,
+        *,
+        max_queue: int = 10000,
+        flush_interval_seconds: float = 0.5,
+        batch_size: int = 200,
+    ) -> None:
+        self._queue: queue.Queue[object] = queue.Queue(maxsize=max_queue)
+        self._flush_interval_seconds = flush_interval_seconds
+        self._batch_size = batch_size
+        self._dropped = 0
+        self._thread = threading.Thread(
+            target=self._run,
+            name="ndjson-writer",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def enqueue(self, path: Path, record: dict[str, Any]) -> bool:
+        try:
+            self._queue.put_nowait((str(path), record))
+        except queue.Full:
+            self._dropped += 1
+            return False
+        return True
+
+    def close(self, timeout_seconds: float = 5.0) -> None:
+        with contextlib.suppress(queue.Full):
+            self._queue.put_nowait(_IO_WRITER_STOP)
+        self._thread.join(timeout=timeout_seconds)
+
+    def stats(self) -> dict[str, int]:
+        return {
+            "queue_size": self._queue.qsize(),
+            "dropped": self._dropped,
+        }
+
+    def _run(self) -> None:
+        files: dict[str, Any] = {}
+        pending: dict[str, list[bytes]] = {}
+        pending_count = 0
+        last_flush = time.time()
+        try:
+            while True:
+                item = None
+                try:
+                    item = self._queue.get(timeout=self._flush_interval_seconds)
+                except queue.Empty:
+                    item = None
+                if item is _IO_WRITER_STOP:
+                    self._flush_pending(pending, files)
+                    break
+                if item is not None:
+                    path_text, record = item
+                    line = json.dumps(
+                        record,
+                        ensure_ascii=True,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                    pending.setdefault(path_text, []).append(line + b"\n")
+                    pending_count += 1
+                now = time.time()
+                if (
+                    pending_count >= self._batch_size
+                    or now - last_flush >= self._flush_interval_seconds
+                ):
+                    if pending_count:
+                        self._flush_pending(pending, files)
+                        pending_count = 0
+                    last_flush = now
+        finally:
+            self._flush_pending(pending, files)
+            for handle in files.values():
+                with contextlib.suppress(Exception):
+                    handle.flush()
+                    handle.close()
+
+    @staticmethod
+    def _flush_pending(pending: dict[str, list[bytes]], files: dict[str, Any]) -> None:
+        for path_text, lines in list(pending.items()):
+            if not lines:
+                continue
+            handle = files.get(path_text)
+            if handle is None:
+                path = Path(path_text)
+                path.parent.mkdir(parents=True, exist_ok=True)
+                handle = path.open("ab")
+                files[path_text] = handle
+            handle.write(b"".join(lines))
+            handle.flush()
+        pending.clear()
+
+
 def _default_user_agent_header() -> str | None:
     with contextlib.suppress(Exception):
         import websockets.http11 as http11
@@ -81,6 +426,7 @@ FATAL_LOW_DISK = "LOW_DISK"
 FATAL_DROP = "DROP"
 FATAL_LATENCY = "LATENCY_FATAL"
 FATAL_BACKPRESSURE = "BACKPRESSURE_STALL"
+FATAL_WRITE_QUEUE = "WRITE_QUEUE_FULL"
 FATAL_RECONNECT_STORM = "RECONNECT_STORM"
 FATAL_VERIFY = "VERIFY_CORRUPTION"
 FATAL_SUBSCRIBE_CONFIRM = "SUBSCRIBE_CONFIRM_FAIL"
@@ -122,6 +468,24 @@ class ShardStats:
         for msg_type, count in msg_type_counts.items():
             self.msg_type_counts[msg_type] = self.msg_type_counts.get(msg_type, 0) + count
 
+    def record_counts(
+        self,
+        token_ids: Iterable[str],
+        msg_type_counts: dict[str, int],
+    ) -> None:
+        for token_id in token_ids:
+            self.token_ids.add(token_id)
+        for msg_type, count in msg_type_counts.items():
+            self.msg_type_counts[msg_type] = self.msg_type_counts.get(msg_type, 0) + count
+
+
+@dataclass(frozen=True)
+class ShardTargetPlan:
+    token_ids: list[str]
+    groups: list[list[str]]
+    confirm_token_ids: list[str]
+    target_version: int
+
 
 @dataclass
 class ShardTarget:
@@ -141,7 +505,7 @@ class ShardState:
     idx_path: Path
     frames_fh: Any
     idx_fh: Any
-    ring: deque[bytes]
+    ring: deque[tuple[bytes, bytes] | bytes]
     stats: ShardStats = field(default_factory=ShardStats)
     last_seen: dict[str, int] = field(default_factory=dict)
     reconnects: int = 0
@@ -155,6 +519,7 @@ class ShardState:
     last_subscribe_group_index: int | None = None
     subscribe_variant_locked: str | None = None
     subscribe_variant_index: int = 0
+    last_yield_mono_ns: int = 0
 
 
 @dataclass
@@ -173,6 +538,15 @@ class UniverseState:
     refresh_churn_guard_count: int = 0
     refresh_skipped_delta_below_min_count: int = 0
     refresh_last_decision_reason: str = "SKIPPED_DELTA_BELOW_MIN"
+    refresh_inflight_future: asyncio.Future | None = None
+    refresh_inflight_started_mono_ns: int | None = None
+    refresh_inflight_timed_out: bool = False
+    refresh_duration_ms_last: float = 0.0
+    refresh_worker_duration_ms_last: float = 0.0
+    refresh_gamma_pages_fetched_last: int = 0
+    refresh_markets_seen_last: int = 0
+    refresh_tokens_selected_last: int = 0
+    refresh_inflight_skipped_count: int = 0
     tokens_added_last: int = 0
     tokens_removed_last: int = 0
     shards_refreshed_last: int = 0
@@ -189,6 +563,25 @@ class UniverseState:
     fee_rate_unknown_count_last: int = 0
 
 
+@dataclass(frozen=True)
+class RefreshPlan:
+    snapshot: UniverseSnapshot
+    desired_token_ids: set[str]
+    desired_market_ids: set[str]
+    ordered_tokens: list[str]
+    shard_targets: dict[int, ShardTargetPlan]
+    segment_by_token_id: dict[str, SegmentTag]
+    segment_by_market_id: dict[str, SegmentTag]
+    policy_counts: dict[str, int]
+    fee_regime_state: FeeRegimeState
+    fee_regime_sampled_tokens_count: int
+    fee_rate_unknown_count: int
+    gamma_pages_fetched: int
+    markets_seen: int
+    tokens_selected: int
+    worker_duration_ms: float
+
+
 @dataclass
 class CaptureState:
     run: RunBootstrap
@@ -199,8 +592,17 @@ class CaptureState:
     fee_rate_client: FeeRateClient | None = None
     policy_selector: PolicySelector | None = None
     fee_regime_monitor: FeeRegimeMonitor | None = None
+    refresh_executor: ThreadPoolExecutor | None = None
+    refresh_worker: "UniverseRefreshWorker | None" = None
+    io_writer: _NdjsonWriter | None = None
+    parse_worker: _ParseWorker | None = None
+    parse_dropped_total: int = 0
+    frame_writer: _FrameWriter | None = None
+    frame_write_dropped_total: int = 0
+    loop_lag_samples_ms: deque[float] = field(default_factory=lambda: deque(maxlen=1000))
     stop_event: asyncio.Event = field(default_factory=asyncio.Event)
     stop_reason: str | None = None
+    gc_was_enabled: bool = False
     backpressure_breach_count: int = 0
     fatal_event: asyncio.Event = field(default_factory=asyncio.Event)
     fatal_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
@@ -218,6 +620,24 @@ def _quantile_from_samples(samples: Iterable[int], percentile: float) -> int:
     if not values:
         return 0
     return quantile(values, percentile)
+
+
+def _quantiles_from_samples(
+    samples: Iterable[int],
+    percentiles: Iterable[float],
+) -> dict[float, int]:
+    values = [value for value in samples if value > 0]
+    result: dict[float, int] = {}
+    if not values:
+        for percentile in percentiles:
+            result[percentile] = 0
+        return result
+    ordered = sorted(values)
+    count = len(ordered)
+    for percentile in percentiles:
+        rank = max(0, ceil(percentile / 100.0 * count) - 1)
+        result[percentile] = ordered[rank]
+    return result
 
 
 def _mark_reconnecting(shard: ShardState) -> None:
@@ -721,11 +1141,27 @@ def _build_shard_targets(
     target_version: int,
     scores: dict[str, float] | None = None,
 ) -> dict[int, ShardTarget]:
+    plans = _build_shard_target_plans(
+        token_ids,
+        config,
+        target_version=target_version,
+        scores=scores,
+    )
+    return _materialize_shard_targets(plans)
+
+
+def _build_shard_target_plans(
+    token_ids: list[str],
+    config: Config,
+    *,
+    target_version: int,
+    scores: dict[str, float] | None = None,
+) -> dict[int, ShardTargetPlan]:
     ordered_tokens = _sorted_unique_tokens(token_ids)
     shard_map = assign_shards_by_token(ordered_tokens, config.ws_shards)
     if scores is None:
         scores = {}
-    targets: dict[int, ShardTarget] = {}
+    targets: dict[int, ShardTargetPlan] = {}
     for shard_id, tokens in shard_map.items():
         groups = split_subscribe_groups(
             tokens,
@@ -733,7 +1169,7 @@ def _build_shard_targets(
             config.ws_subscribe_max_bytes,
             "A",
         )
-        targets[shard_id] = ShardTarget(
+        targets[shard_id] = ShardTargetPlan(
             token_ids=tokens,
             groups=groups,
             confirm_token_ids=_select_confirm_tokens(
@@ -744,6 +1180,20 @@ def _build_shard_targets(
             target_version=target_version,
         )
     return targets
+
+
+def _materialize_shard_targets(
+    targets: dict[int, ShardTargetPlan],
+) -> dict[int, ShardTarget]:
+    materialized: dict[int, ShardTarget] = {}
+    for shard_id, target in targets.items():
+        materialized[shard_id] = ShardTarget(
+            token_ids=target.token_ids,
+            groups=target.groups,
+            confirm_token_ids=target.confirm_token_ids,
+            target_version=target.target_version,
+        )
+    return materialized
 
 
 def _select_changed_shards(
@@ -1001,6 +1451,12 @@ def _eligible_token_ids(
 KEEPALIVE_PAYLOAD = object()
 
 
+def _fast_confirm_event(payload_bytes: bytes) -> bool:
+    if payload_bytes in (b"PONG", b"PING"):
+        return False
+    return True
+
+
 def _confirm_event_from_payload(payload_bytes: bytes) -> tuple[bool, Any | None]:
     if payload_bytes in (b"PONG", b"PING"):
         return False, KEEPALIVE_PAYLOAD
@@ -1016,18 +1472,18 @@ def _confirm_event_from_payload(payload_bytes: bytes) -> tuple[bool, Any | None]
 def _ring_header_sample(shard: ShardState, max_entries: int) -> list[dict[str, Any]]:
     samples: list[dict[str, Any]] = []
     for entry in list(shard.ring)[-max_entries:]:
-        if len(entry) < 8:
+        header_bytes = entry[0] if isinstance(entry, tuple) else entry
+        if len(header_bytes) < 8:
             continue
-        magic = entry[:8]
+        magic = header_bytes[:8]
         try:
             schema_version = 1 if magic == frames_magic(1) else 2 if magic == frames_magic(2) else None
             if schema_version is None:
                 continue
             header_struct = frames_header_struct(schema_version)
             header_len = header_struct.size
-            if len(entry) < header_len:
+            if len(header_bytes) < header_len:
                 continue
-            header_bytes = entry[:header_len]
             if schema_version == 1:
                 magic, schema_field, flags, rx_mono_ns, payload_len, payload_crc32 = (
                     header_struct.unpack(header_bytes)
@@ -1116,10 +1572,16 @@ def _build_missing_tokens_dump(
 
 
 def _write_runlog(run_dir: Path, record: dict[str, Any]) -> None:
+    if _IO_WRITER is not None:
+        _IO_WRITER.enqueue(run_dir / "runlog.ndjson", record)
+        return
     _append_ndjson(run_dir / "runlog.ndjson", record)
 
 
 def _write_metrics(path: Path, record: dict[str, Any]) -> None:
+    if _IO_WRITER is not None:
+        _IO_WRITER.enqueue(path, record)
+        return
     _append_ndjson(path, record)
 
 
@@ -1273,7 +1735,86 @@ async def _trigger_fatal(
             _write_json(state.run.run_dir / "missing_tokens.json", missing_tokens)
         for shard in state.shards:
             dump_path = state.run.run_dir / f"last_frames_shard_{shard.shard_id:02d}.bin"
-            dump_path.write_bytes(b"".join(shard.ring))
+            chunks: list[bytes] = []
+            for entry in shard.ring:
+                if isinstance(entry, tuple):
+                    chunks.append(entry[0])
+                    chunks.append(entry[1])
+                else:
+                    chunks.append(entry)
+            dump_path.write_bytes(b"".join(chunks))
+
+
+async def _loop_lag_monitor(state: CaptureState) -> None:
+    interval_ns = 100_000_000
+    next_tick = monotonic_ns() + interval_ns
+    while not state.fatal_event.is_set() and not state.stop_event.is_set():
+        now_ns = monotonic_ns()
+        sleep_ns = next_tick - now_ns
+        if sleep_ns > 0:
+            await asyncio.sleep(sleep_ns / 1_000_000_000)
+        now_ns = monotonic_ns()
+        lag_ns = max(0, now_ns - next_tick)
+        state.loop_lag_samples_ms.append(lag_ns / 1_000_000.0)
+        next_tick += interval_ns
+        if next_tick < now_ns:
+            next_tick = now_ns + interval_ns
+
+
+async def _parse_results_loop(state: CaptureState) -> None:
+    worker = state.parse_worker
+    if worker is None:
+        return
+    max_batch = 500
+    sleep_seconds = 0.01
+    while not state.fatal_event.is_set() and not state.stop_event.is_set():
+        processed = 0
+        while processed < max_batch:
+            result = worker.get_nowait()
+            if result is None:
+                break
+            processed += 1
+            shard = state.shards[result.shard_id]
+            if result.decode_error:
+                shard.stats.decode_errors += 1
+                continue
+            shard.stats.record_counts(result.token_ids, result.msg_type_counts)
+            for token_id in result.token_ids:
+                shard.last_seen[token_id] = result.rx_mono_ns
+                if token_id in state.universe.token_added_mono_ns:
+                    state.universe.token_added_mono_ns.pop(token_id, None)
+        if processed == 0:
+            await asyncio.sleep(sleep_seconds)
+
+
+async def _write_results_loop(state: CaptureState) -> None:
+    writer = state.frame_writer
+    if writer is None:
+        return
+    max_batch = 500
+    sleep_seconds = 0.01
+    while not state.fatal_event.is_set() and not state.stop_event.is_set():
+        processed = 0
+        while processed < max_batch:
+            result = writer.get_nowait()
+            if result is None:
+                break
+            processed += 1
+            shard = state.shards[result.shard_id]
+            shard.stats.record(
+                result.payload_len,
+                frames_header_len(result.schema_version),
+                idx_entry_len(result.schema_version),
+                result.write_duration_ns,
+                result.ingest_latency_ns,
+                result.backpressure_ns,
+                [],
+                {},
+                state.config.capture_metrics_max_samples,
+            )
+            shard.ring.append((result.header_bytes, result.payload_bytes))
+        if processed == 0:
+            await asyncio.sleep(sleep_seconds)
 
 
 async def _heartbeat_loop(state: CaptureState) -> None:
@@ -1286,6 +1827,7 @@ async def _heartbeat_loop(state: CaptureState) -> None:
         for shard in state.shards
     }
     next_tick = state.run.t0_mono_ns + interval_ns
+    last_yield_ns = monotonic_ns()
     while not state.fatal_event.is_set() and not state.stop_event.is_set():
         now_ns = monotonic_ns()
         if now_ns < next_tick:
@@ -1341,6 +1883,15 @@ async def _heartbeat_loop(state: CaptureState) -> None:
                 token_added_mono_ns=state.universe.token_added_mono_ns,
                 grace_ns=grace_ns,
             )
+            write_quantiles = _quantiles_from_samples(
+                shard_stats.write_durations_ns, (50, 95, 99)
+            )
+            ingest_quantiles = _quantiles_from_samples(
+                shard_stats.ingest_latencies_ns, (50, 95, 99)
+            )
+            backpressure_quantiles = _quantiles_from_samples(
+                shard_stats.backpressure_ns, (50, 95, 99)
+            )
             if shard.confirm_deadline_mono_ns is None:
                 deadline_remaining_ms = -1
             else:
@@ -1360,21 +1911,15 @@ async def _heartbeat_loop(state: CaptureState) -> None:
                 / max(elapsed_ns / 1_000_000_000.0, 1e-9),
                 "bytes_per_sec": shard_stats.bytes_written
                 / max(elapsed_ns / 1_000_000_000.0, 1e-9),
-                "write_ns_p50": _quantile_from_samples(shard_stats.write_durations_ns, 50),
-                "write_ns_p95": _quantile_from_samples(shard_stats.write_durations_ns, 95),
-                "write_ns_p99": _quantile_from_samples(shard_stats.write_durations_ns, 99),
-                "ingest_ns_p50": _quantile_from_samples(shard_stats.ingest_latencies_ns, 50),
-                "ingest_ns_p95": _quantile_from_samples(shard_stats.ingest_latencies_ns, 95),
-                "ingest_ns_p99": _quantile_from_samples(shard_stats.ingest_latencies_ns, 99),
-                "backpressure_ns_p50": _quantile_from_samples(
-                    shard_stats.backpressure_ns, 50
-                ),
-                "backpressure_ns_p95": _quantile_from_samples(
-                    shard_stats.backpressure_ns, 95
-                ),
-                "backpressure_ns_p99": _quantile_from_samples(
-                    shard_stats.backpressure_ns, 99
-                ),
+                "write_ns_p50": write_quantiles[50],
+                "write_ns_p95": write_quantiles[95],
+                "write_ns_p99": write_quantiles[99],
+                "ingest_ns_p50": ingest_quantiles[50],
+                "ingest_ns_p95": ingest_quantiles[95],
+                "ingest_ns_p99": ingest_quantiles[99],
+                "backpressure_ns_p50": backpressure_quantiles[50],
+                "backpressure_ns_p95": backpressure_quantiles[95],
+                "backpressure_ns_p99": backpressure_quantiles[99],
                 "coverage_pct": shard_coverage_pct,
                 "token_ids_seen": len(shard_stats.token_ids),
                 "token_ids_assigned": len(shard.token_ids),
@@ -1387,6 +1932,10 @@ async def _heartbeat_loop(state: CaptureState) -> None:
                 "msg_type_counts": shard_stats.msg_type_counts,
             }
             _write_metrics(metrics_shard_paths[shard.shard_id], shard_record)
+            now_ns = monotonic_ns()
+            if now_ns - last_yield_ns >= 5_000_000:
+                last_yield_ns = now_ns
+                await asyncio.sleep(0)
 
         if state.pinned_tokens:
             last_seen_global: dict[str, int] = {}
@@ -1404,6 +1953,24 @@ async def _heartbeat_loop(state: CaptureState) -> None:
         fee_rate_stats = (
             state.fee_rate_client.stats_snapshot() if state.fee_rate_client else {}
         )
+        parse_stats = (
+            state.parse_worker.stats() if state.parse_worker is not None else {}
+        )
+        frame_write_stats = (
+            state.frame_writer.stats() if state.frame_writer is not None else {}
+        )
+        loop_lag_samples = list(state.loop_lag_samples_ms)
+        loop_lag_ms_max_last_interval = (
+            max(loop_lag_samples) if loop_lag_samples else 0.0
+        )
+        state.loop_lag_samples_ms.clear()
+        global_write_quantiles = _quantiles_from_samples(global_write_samples, (50, 95, 99))
+        global_ingest_quantiles = _quantiles_from_samples(
+            global_ingest_samples, (50, 95, 99)
+        )
+        global_backpressure_quantiles = _quantiles_from_samples(
+            global_backpressure_samples, (50, 95, 99)
+        )
         global_record = {
             "record_type": "heartbeat",
             "run_id": state.run.run_id,
@@ -1414,15 +1981,15 @@ async def _heartbeat_loop(state: CaptureState) -> None:
             "bytes_written": global_bytes,
             "msgs_per_sec": global_frames / max(elapsed_ns / 1_000_000_000.0, 1e-9),
             "bytes_per_sec": global_bytes / max(elapsed_ns / 1_000_000_000.0, 1e-9),
-            "write_ns_p50": _quantile_from_samples(global_write_samples, 50),
-            "write_ns_p95": _quantile_from_samples(global_write_samples, 95),
-            "write_ns_p99": _quantile_from_samples(global_write_samples, 99),
-            "ingest_ns_p50": _quantile_from_samples(global_ingest_samples, 50),
-            "ingest_ns_p95": _quantile_from_samples(global_ingest_samples, 95),
-            "ingest_ns_p99": _quantile_from_samples(global_ingest_samples, 99),
-            "backpressure_ns_p50": _quantile_from_samples(global_backpressure_samples, 50),
-            "backpressure_ns_p95": _quantile_from_samples(global_backpressure_samples, 95),
-            "backpressure_ns_p99": _quantile_from_samples(global_backpressure_samples, 99),
+            "write_ns_p50": global_write_quantiles[50],
+            "write_ns_p95": global_write_quantiles[95],
+            "write_ns_p99": global_write_quantiles[99],
+            "ingest_ns_p50": global_ingest_quantiles[50],
+            "ingest_ns_p95": global_ingest_quantiles[95],
+            "ingest_ns_p99": global_ingest_quantiles[99],
+            "backpressure_ns_p50": global_backpressure_quantiles[50],
+            "backpressure_ns_p95": global_backpressure_quantiles[95],
+            "backpressure_ns_p99": global_backpressure_quantiles[99],
             "coverage_pct": global_coverage_pct,
             "token_ids_seen": len(global_tokens_seen),
             "token_ids_assigned": len(state.pinned_tokens),
@@ -1442,10 +2009,17 @@ async def _heartbeat_loop(state: CaptureState) -> None:
             "refresh_interval_seconds_current": state.universe.effective_refresh_interval_seconds,
             "refresh_skipped_delta_below_min_count": state.universe.refresh_skipped_delta_below_min_count,
             "refresh_last_decision_reason": state.universe.refresh_last_decision_reason,
+            "refresh_inflight_skipped_count": state.universe.refresh_inflight_skipped_count,
+            "universe_refresh_duration_ms": state.universe.refresh_duration_ms_last,
+            "universe_refresh_worker_duration_ms": state.universe.refresh_worker_duration_ms_last,
+            "gamma_pages_fetched": state.universe.refresh_gamma_pages_fetched_last,
+            "markets_seen": state.universe.refresh_markets_seen_last,
+            "tokens_selected": state.universe.refresh_tokens_selected_last,
             "expected_churn_bool": state.universe.expected_churn_last,
             "expected_churn_reason": state.universe.expected_churn_reason_last,
             "rollover_window_hit": state.universe.expected_churn_rollover_hit_last,
             "expiry_window_hit": state.universe.expected_churn_expiry_hit_last,
+            "loop_lag_ms_max_last_interval": loop_lag_ms_max_last_interval,
             "fee_rate_cache_hits": fee_rate_stats.get("cache_hits", 0),
             "fee_rate_cache_misses": fee_rate_stats.get("cache_misses", 0),
             "fee_rate_unknown_count": state.universe.fee_rate_unknown_count_last,
@@ -1453,6 +2027,18 @@ async def _heartbeat_loop(state: CaptureState) -> None:
             "circuit_breaker_reason": state.universe.fee_regime_reason,
             "sampled_tokens_count": state.universe.fee_regime_sampled_tokens_count,
             "policy_counts": state.universe.policy_counts_last,
+            "parse_queue_size": parse_stats.get("queue_size", 0),
+            "parse_results_queue_size": parse_stats.get("results_size", 0),
+            "parse_dropped": state.parse_dropped_total,
+            "parse_worker_dropped": parse_stats.get("dropped", 0),
+            "parse_results_dropped": parse_stats.get("results_dropped", 0),
+            "parse_processed": parse_stats.get("processed", 0),
+            "frame_write_queue_size": frame_write_stats.get("queue_size", 0),
+            "frame_write_results_queue_size": frame_write_stats.get("results_size", 0),
+            "frame_write_dropped": state.frame_write_dropped_total,
+            "frame_write_worker_dropped": frame_write_stats.get("dropped", 0),
+            "frame_write_results_dropped": frame_write_stats.get("results_dropped", 0),
+            "frame_write_processed": frame_write_stats.get("processed", 0),
         }
         _write_metrics(metrics_global, global_record)
         state.heartbeat_samples.append(global_record)
@@ -1488,39 +2074,7 @@ def _handle_payload(
     rx_wall_ns_utc: int,
 ) -> None:
     payload_bytes, flags = _payload_bytes(raw)
-    write_start_ns = monotonic_ns()
-    record = append_record(
-        shard.frames_fh,
-        shard.idx_fh,
-        payload_bytes,
-        rx_mono_ns,
-        rx_wall_ns_utc,
-        flags=flags,
-        schema_version=state.config.capture_frames_schema_version,
-    )
-    write_end_ns = monotonic_ns()
-    backpressure_ns = max(0, write_start_ns - rx_mono_ns)
-    header_struct = frames_header_struct(record.schema_version)
-    if record.schema_version == 1:
-        header_bytes = header_struct.pack(
-            frames_magic(record.schema_version),
-            record.schema_version,
-            record.flags,
-            record.rx_mono_ns,
-            record.payload_len,
-            record.payload_crc32,
-        )
-    else:
-        header_bytes = header_struct.pack(
-            frames_magic(record.schema_version),
-            record.schema_version,
-            record.flags,
-            record.rx_mono_ns,
-            record.rx_wall_ns_utc,
-            record.payload_len,
-            record.payload_crc32,
-        )
-    confirm_event, payload = _confirm_event_from_payload(payload_bytes)
+    confirm_event = _fast_confirm_event(payload_bytes)
     if confirm_event:
         shard.confirm_events_seen += 1
         if not shard.confirmed and (
@@ -1552,9 +2106,39 @@ def _handle_payload(
                 runlog_record,
             )
 
-    shard.ring.append(header_bytes + record.payload)
-
-    if payload is KEEPALIVE_PAYLOAD:
+    if state.frame_writer is not None:
+        if not state.frame_writer.enqueue(
+            _FrameWriteJob(
+                shard_id=shard.shard_id,
+                payload_bytes=payload_bytes,
+                rx_mono_ns=rx_mono_ns,
+                rx_wall_ns_utc=rx_wall_ns_utc,
+                flags=flags,
+            )
+        ):
+            state.frame_write_dropped_total += 1
+            if not state.fatal_event.is_set():
+                asyncio.get_running_loop().create_task(
+                    _trigger_fatal(
+                        state,
+                        FATAL_WRITE_QUEUE,
+                        "frame write queue full",
+                    )
+                )
+            return
+    else:
+        write_start_ns = monotonic_ns()
+        record = append_record(
+            shard.frames_fh,
+            shard.idx_fh,
+            payload_bytes,
+            rx_mono_ns,
+            rx_wall_ns_utc,
+            flags=flags,
+            schema_version=state.config.capture_frames_schema_version,
+        )
+        write_end_ns = monotonic_ns()
+        backpressure_ns = max(0, write_start_ns - rx_mono_ns)
         shard.stats.record(
             record.payload_len,
             frames_header_len(record.schema_version),
@@ -1566,40 +2150,54 @@ def _handle_payload(
             {},
             state.config.capture_metrics_max_samples,
         )
+        header_struct = frames_header_struct(record.schema_version)
+        if record.schema_version == 1:
+            header_bytes = header_struct.pack(
+                frames_magic(record.schema_version),
+                record.schema_version,
+                record.flags,
+                record.rx_mono_ns,
+                record.payload_len,
+                record.payload_crc32,
+            )
+        else:
+            header_bytes = header_struct.pack(
+                frames_magic(record.schema_version),
+                record.schema_version,
+                record.flags,
+                record.rx_mono_ns,
+                record.rx_wall_ns_utc,
+                record.payload_len,
+                record.payload_crc32,
+            )
+        shard.ring.append((header_bytes, record.payload))
+
+    if payload_bytes in (b"PONG", b"PING"):
         return
 
-    if payload is None:
-        shard.stats.decode_errors += 1
-        shard.stats.record(
-            record.payload_len,
-            frames_header_len(record.schema_version),
-            idx_entry_len(record.schema_version),
-            write_end_ns - write_start_ns,
-            write_end_ns - rx_mono_ns,
-            backpressure_ns,
-            [],
-            {},
-            state.config.capture_metrics_max_samples,
+    if state.parse_worker is None:
+        try:
+            payload = orjson.loads(payload_bytes)
+        except orjson.JSONDecodeError:
+            shard.stats.decode_errors += 1
+            return
+        token_pairs, msg_type_counts = _extract_minimal_fields(payload)
+        token_ids = [token_id for token_id, _ in token_pairs]
+        shard.stats.record_counts(token_ids, msg_type_counts)
+        for token_id in token_ids:
+            shard.last_seen[token_id] = rx_mono_ns
+            if token_id in state.universe.token_added_mono_ns:
+                state.universe.token_added_mono_ns.pop(token_id, None)
+        return
+
+    if not state.parse_worker.enqueue(
+        _ParseJob(
+            shard_id=shard.shard_id,
+            payload_bytes=payload_bytes,
+            rx_mono_ns=rx_mono_ns,
         )
-        return
-
-    token_pairs, msg_type_counts = _extract_minimal_fields(payload)
-    token_ids = [token_id for token_id, _ in token_pairs]
-    shard.stats.record(
-        record.payload_len,
-        frames_header_len(record.schema_version),
-        idx_entry_len(record.schema_version),
-        write_end_ns - write_start_ns,
-        write_end_ns - rx_mono_ns,
-        backpressure_ns,
-        token_ids,
-        msg_type_counts,
-        state.config.capture_metrics_max_samples,
-    )
-    for token_id in token_ids:
-        shard.last_seen[token_id] = rx_mono_ns
-        if token_id in state.universe.token_added_mono_ns:
-            state.universe.token_added_mono_ns.pop(token_id, None)
+    ):
+        state.parse_dropped_total += 1
 
 
 def _refresh_requested(shard: ShardState) -> bool:
@@ -1652,6 +2250,158 @@ async def _wait_for_refresh_or_fatal(state: CaptureState, shard: ShardState) -> 
             await task
 
 
+def _compute_refresh_plan_sync(
+    config: Config,
+    *,
+    universe_version: int,
+    run_id: str,
+    canary_tokens: list[str],
+    session: requests.Session,
+    loop: asyncio.AbstractEventLoop | None,
+    fee_rate_client: FeeRateClient | None,
+    policy_selector: PolicySelector | None,
+    fee_regime_monitor: FeeRegimeMonitor | None,
+    refresh_timeout_seconds: float,
+) -> RefreshPlan:
+    start_ns = time.perf_counter_ns()
+    stats: dict[str, int] = {}
+    snapshot = compute_desired_universe(
+        config,
+        universe_version=universe_version,
+        session=session,
+        stats=stats,
+    )
+    selected_markets = snapshot.selected_markets or []
+    desired_tokens = {str(token_id) for token_id in snapshot.token_ids}
+    desired_market_ids = {str(market_id) for market_id in snapshot.market_ids}
+    fee_results: dict[str, Any] = {}
+    sample_tokens: list[str] = []
+    fee_regime_state = FeeRegimeState(
+        state="OK",
+        reason="DISABLED",
+        sampled_tokens_count=0,
+        unknown_fee_count=0,
+        observed_fee_rates=[],
+    )
+    if config.fee_rate_enable and fee_rate_client and fee_regime_monitor:
+        sample_tokens = fee_regime_monitor.sample_tokens(
+            desired_tokens,
+            run_id=run_id,
+            universe_version=snapshot.universe_version,
+            sample_size=config.fee_regime_sample_size_per_cycle,
+            canary_token_ids=canary_tokens,
+        )
+        if loop is not None and not loop.is_closed():
+            prefetch_timeout = config.fee_rate_refresh_timeout_seconds
+            if refresh_timeout_seconds > 0:
+                prefetch_timeout = min(prefetch_timeout, refresh_timeout_seconds)
+            if sample_tokens and prefetch_timeout > 0:
+                future = asyncio.run_coroutine_threadsafe(
+                    fee_rate_client.prefetch_fee_rates(
+                        sample_tokens,
+                        timeout_seconds=prefetch_timeout,
+                        max_tokens=config.fee_rate_prefetch_max_tokens,
+                    ),
+                    loop,
+                )
+                try:
+                    future.result(timeout=prefetch_timeout)
+                except FuturesTimeoutError:
+                    with contextlib.suppress(Exception):
+                        future.cancel()
+                except Exception:
+                    with contextlib.suppress(Exception):
+                        future.cancel()
+        fee_results = fee_rate_client.cached_fee_rates(desired_tokens)
+
+    segment_by_token, segment_by_market = build_segment_maps(
+        selected_markets,
+        fee_results_by_token=fee_results,
+    )
+    if config.fee_rate_enable and fee_regime_monitor:
+        fee_regime_state = fee_regime_monitor.evaluate(
+            segment_by_token,
+            token_ids_sampled=sample_tokens,
+        )
+    if policy_selector is not None:
+        next_policy_counts = policy_counts(policy_selector, segment_by_token)
+    else:
+        next_policy_counts = {}
+    scores = _token_score_map(selected_markets)
+    ordered_tokens = _sorted_unique_tokens(snapshot.token_ids)
+    shard_targets = _build_shard_target_plans(
+        ordered_tokens,
+        config,
+        target_version=snapshot.universe_version,
+        scores=scores,
+    )
+    worker_duration_ms = (time.perf_counter_ns() - start_ns) / 1_000_000.0
+    return RefreshPlan(
+        snapshot=snapshot,
+        desired_token_ids=desired_tokens,
+        desired_market_ids=desired_market_ids,
+        ordered_tokens=ordered_tokens,
+        shard_targets=shard_targets,
+        segment_by_token_id=segment_by_token,
+        segment_by_market_id=segment_by_market,
+        policy_counts=next_policy_counts,
+        fee_regime_state=fee_regime_state,
+        fee_regime_sampled_tokens_count=fee_regime_state.sampled_tokens_count,
+        fee_rate_unknown_count=fee_regime_state.unknown_fee_count,
+        gamma_pages_fetched=stats.get("pages_fetched", 0),
+        markets_seen=stats.get("markets_seen", len(selected_markets)),
+        tokens_selected=len(desired_tokens),
+        worker_duration_ms=worker_duration_ms,
+    )
+
+
+class UniverseRefreshWorker:
+    def __init__(
+        self,
+        *,
+        config: Config,
+        loop: asyncio.AbstractEventLoop,
+        fee_rate_client: FeeRateClient | None,
+        policy_selector: PolicySelector | None,
+        fee_regime_monitor: FeeRegimeMonitor | None,
+        canary_tokens: list[str],
+    ) -> None:
+        self._config = config
+        self._loop = loop
+        self._fee_rate_client = fee_rate_client
+        self._policy_selector = policy_selector
+        self._fee_regime_monitor = fee_regime_monitor
+        self._canary_tokens = list(canary_tokens)
+        self._session: requests.Session | None = None
+
+    def close(self) -> None:
+        if self._session is not None:
+            with contextlib.suppress(Exception):
+                self._session.close()
+
+    def compute_plan(
+        self,
+        *,
+        universe_version: int,
+        run_id: str,
+        refresh_timeout_seconds: float,
+    ) -> RefreshPlan:
+        if self._session is None:
+            self._session = requests.Session()
+        return _compute_refresh_plan_sync(
+            self._config,
+            universe_version=universe_version,
+            run_id=run_id,
+            canary_tokens=self._canary_tokens,
+            session=self._session,
+            loop=self._loop,
+            fee_rate_client=self._fee_rate_client,
+            policy_selector=self._policy_selector,
+            fee_regime_monitor=self._fee_regime_monitor,
+            refresh_timeout_seconds=refresh_timeout_seconds,
+        )
+
+
 async def _refresh_loop(state: CaptureState) -> None:
     config = state.config
     baseline_interval = config.capture_universe_refresh_interval_seconds
@@ -1660,149 +2410,210 @@ async def _refresh_loop(state: CaptureState) -> None:
     if state.universe.effective_refresh_interval_seconds <= 0:
         state.universe.effective_refresh_interval_seconds = baseline_interval
     run_dir = state.run.run_dir
-    if state.fee_rate_client is None:
+    if state.fee_rate_client is None and config.fee_rate_enable:
         state.fee_rate_client = _build_fee_rate_client(config)
     if state.policy_selector is None:
         state.policy_selector = _build_policy_selector(config)
     if state.fee_regime_monitor is None:
         state.fee_regime_monitor = _build_fee_regime_monitor(config)
     canary_tokens = _parse_canary_tokens(config.fee_regime_canary_token_ids)
-    while (
-        not state.fatal_event.is_set()
-        and not state.stop_event.is_set()
-        and not state.universe.refresh_cancelled
-    ):
-        await asyncio.sleep(state.universe.effective_refresh_interval_seconds)
-        if (
-            state.fatal_event.is_set()
-            or state.stop_event.is_set()
-            or state.universe.refresh_cancelled
+    if state.refresh_executor is None:
+        state.refresh_executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="universe-refresh",
+        )
+    if state.refresh_worker is None:
+        state.refresh_worker = UniverseRefreshWorker(
+            config=config,
+            loop=asyncio.get_running_loop(),
+            fee_rate_client=state.fee_rate_client,
+            policy_selector=state.policy_selector,
+            fee_regime_monitor=state.fee_regime_monitor,
+            canary_tokens=canary_tokens,
+        )
+    refresh_timeout_seconds = config.capture_universe_refresh_timeout_seconds
+    if refresh_timeout_seconds <= 0:
+        refresh_timeout_seconds = max(baseline_interval, 1.0)
+    try:
+        while (
+            not state.fatal_event.is_set()
+            and not state.stop_event.is_set()
+            and not state.universe.refresh_cancelled
         ):
-            break
-        try:
-            snapshot = compute_desired_universe(
-                config,
-                universe_version=state.universe.universe_version + 1,
-            )
-            desired_tokens = set(snapshot.token_ids)
-            desired_market_ids = {str(market_id) for market_id in snapshot.market_ids}
-            added, removed = _compute_refresh_delta(
-                state.universe.current_token_ids, desired_tokens
-            )
-            added_markets = desired_market_ids - state.universe.current_market_ids
-            removed_markets = state.universe.current_market_ids - desired_market_ids
-            delta_count = len(added) + len(removed)
-            churn_pct = 100.0 * delta_count / max(1, len(state.universe.current_token_ids))
-            state.universe.refresh_churn_pct_last = churn_pct
-            state.universe.tokens_added_last = len(added)
-            state.universe.tokens_removed_last = len(removed)
-
-            selected_markets = snapshot.selected_markets
-            if selected_markets is None:
-                selected_markets = select_active_binary_markets(
-                    fetch_markets(
-                        config.gamma_base_url,
-                        config.rest_timeout,
-                        limit=config.gamma_limit,
-                        max_markets=config.capture_max_markets,
-                    ),
-                    max_markets=config.capture_max_markets,
-                )
-            fee_rate_client = state.fee_rate_client
-            policy_selector = state.policy_selector
-            fee_regime_monitor = state.fee_regime_monitor
-            fee_results: dict[str, Any] = {}
-            sample_tokens: list[str] = []
-            fee_regime_state = FeeRegimeState(
-                state="OK",
-                reason="DISABLED",
-                sampled_tokens_count=0,
-                unknown_fee_count=0,
-                observed_fee_rates=[],
-            )
-            if config.fee_rate_enable and fee_rate_client and fee_regime_monitor:
-                sample_tokens = fee_regime_monitor.sample_tokens(
-                    desired_tokens,
-                    run_id=state.run.run_id,
-                    universe_version=snapshot.universe_version,
-                    sample_size=config.fee_regime_sample_size_per_cycle,
-                    canary_token_ids=canary_tokens,
-                )
-                await fee_rate_client.prefetch_fee_rates(
-                    sample_tokens,
-                    timeout_seconds=config.fee_rate_refresh_timeout_seconds,
-                    max_tokens=config.fee_rate_prefetch_max_tokens,
-                )
-                fee_results = fee_rate_client.cached_fee_rates(desired_tokens)
-
-            next_segment_by_token, next_segment_by_market = build_segment_maps(
-                list(selected_markets),
-                fee_results_by_token=fee_results,
-            )
-            if config.fee_rate_enable and fee_regime_monitor:
-                fee_regime_state = fee_regime_monitor.evaluate(
-                    next_segment_by_token,
-                    token_ids_sampled=sample_tokens,
-                )
-            state.universe.fee_regime_state = fee_regime_state.state
-            state.universe.fee_regime_reason = fee_regime_state.reason
-            state.universe.fee_regime_sampled_tokens_count = (
-                fee_regime_state.sampled_tokens_count
-            )
-            state.universe.fee_rate_unknown_count_last = (
-                fee_regime_state.unknown_fee_count
-            )
-
-            expected_summary = _expected_churn_for_refresh(
-                time.time_ns(),
-                removed_markets,
-                added_markets,
-                state.universe.segment_by_market_id,
-                next_segment_by_market,
-                config,
-            )
-            state.universe.expected_churn_last = expected_summary.expected_churn
-            state.universe.expected_churn_reason_last = expected_summary.reason
-            state.universe.expected_churn_rollover_hit_last = (
-                expected_summary.rollover_window_hit
-            )
-            state.universe.expected_churn_expiry_hit_last = (
-                expected_summary.expiry_window_hit
-            )
-
-            if not _should_apply_refresh(
-                added,
-                removed,
-                config.capture_universe_refresh_min_delta_tokens,
+            await asyncio.sleep(state.universe.effective_refresh_interval_seconds)
+            if (
+                state.fatal_event.is_set()
+                or state.stop_event.is_set()
+                or state.universe.refresh_cancelled
             ):
-                state.universe.refresh_skipped_delta_below_min_count += 1
-                state.universe.shards_refreshed_last = 0
-                state.universe.refresh_last_decision_reason = "SKIPPED_DELTA_BELOW_MIN"
-                continue
-            guard_triggered = (
-                churn_pct > config.capture_universe_refresh_max_churn_pct
-            )
-            bypass_guard = guard_triggered and expected_summary.expected_churn
-            if bypass_guard:
-                state.universe.refresh_last_decision_reason = "BYPASSED_EXPECTED_CHURN"
-                guard_triggered = False
-            (
-                next_interval,
-                next_guard_count,
-                guard_fatal,
-            ) = _apply_churn_guard_policy(
-                state.universe.effective_refresh_interval_seconds,
-                baseline_interval,
-                config.capture_universe_refresh_max_interval_seconds,
-                guard_triggered=guard_triggered,
-                guard_count=state.universe.refresh_churn_guard_count,
-                fatal_threshold=config.capture_universe_refresh_churn_guard_consecutive_fatal,
-            )
-            state.universe.effective_refresh_interval_seconds = next_interval
-            state.universe.refresh_churn_guard_count = next_guard_count
-            if guard_triggered:
-                state.universe.shards_refreshed_last = 0
-                state.universe.refresh_last_decision_reason = "SKIPPED_CHURN_GUARD"
+                break
+            inflight = state.universe.refresh_inflight_future
+            if inflight is not None:
+                if not inflight.done():
+                    state.universe.refresh_inflight_skipped_count += 1
+                    state.universe.shards_refreshed_last = 0
+                    state.universe.refresh_last_decision_reason = "SKIPPED_INFLIGHT"
+                    inflight_age_ms = None
+                    if state.universe.refresh_inflight_started_mono_ns is not None:
+                        inflight_age_ms = int(
+                            (monotonic_ns() - state.universe.refresh_inflight_started_mono_ns)
+                            / 1_000_000
+                        )
+                    _write_runlog(
+                        run_dir,
+                        {
+                            "record_type": "universe_refresh",
+                            "run_id": state.run.run_id,
+                            "universe_version": state.universe.universe_version + 1,
+                            "interval_seconds_used": state.universe.effective_refresh_interval_seconds,
+                            "reason": "SKIPPED_INFLIGHT",
+                            "inflight_age_ms": inflight_age_ms,
+                        },
+                    )
+                    continue
+                try:
+                    inflight.result()
+                except Exception:
+                    pass
+                state.universe.refresh_inflight_future = None
+                state.universe.refresh_inflight_timed_out = False
+                state.universe.refresh_inflight_started_mono_ns = None
+            try:
+                started_ns = monotonic_ns()
+                refresh_call = functools.partial(
+                    state.refresh_worker.compute_plan,
+                    universe_version=state.universe.universe_version + 1,
+                    run_id=state.run.run_id,
+                    refresh_timeout_seconds=refresh_timeout_seconds,
+                )
+                future = asyncio.get_running_loop().run_in_executor(
+                    state.refresh_executor,
+                    refresh_call,
+                )
+                state.universe.refresh_inflight_future = future
+                state.universe.refresh_inflight_started_mono_ns = started_ns
+                state.universe.refresh_inflight_timed_out = False
+                plan = await asyncio.wait_for(
+                    asyncio.shield(future),
+                    timeout=refresh_timeout_seconds,
+                )
+                duration_ms = (monotonic_ns() - started_ns) / 1_000_000.0
+                state.universe.refresh_duration_ms_last = duration_ms
+                state.universe.refresh_worker_duration_ms_last = plan.worker_duration_ms
+                state.universe.refresh_gamma_pages_fetched_last = plan.gamma_pages_fetched
+                state.universe.refresh_markets_seen_last = plan.markets_seen
+                state.universe.refresh_tokens_selected_last = plan.tokens_selected
+                state.universe.fee_regime_state = plan.fee_regime_state.state
+                state.universe.fee_regime_reason = plan.fee_regime_state.reason
+                state.universe.fee_regime_sampled_tokens_count = (
+                    plan.fee_regime_sampled_tokens_count
+                )
+                state.universe.fee_rate_unknown_count_last = plan.fee_rate_unknown_count
+                snapshot = plan.snapshot
+                desired_tokens = plan.desired_token_ids
+                desired_market_ids = plan.desired_market_ids
+                added, removed = _compute_refresh_delta(
+                    state.universe.current_token_ids, desired_tokens
+                )
+                added_markets = desired_market_ids - state.universe.current_market_ids
+                removed_markets = state.universe.current_market_ids - desired_market_ids
+                delta_count = len(added) + len(removed)
+                churn_pct = 100.0 * delta_count / max(
+                    1, len(state.universe.current_token_ids)
+                )
+                state.universe.refresh_churn_pct_last = churn_pct
+                state.universe.tokens_added_last = len(added)
+                state.universe.tokens_removed_last = len(removed)
+
+                expected_summary = _expected_churn_for_refresh(
+                    time.time_ns(),
+                    removed_markets,
+                    added_markets,
+                    state.universe.segment_by_market_id,
+                    plan.segment_by_market_id,
+                    config,
+                )
+                state.universe.expected_churn_last = expected_summary.expected_churn
+                state.universe.expected_churn_reason_last = expected_summary.reason
+                state.universe.expected_churn_rollover_hit_last = (
+                    expected_summary.rollover_window_hit
+                )
+                state.universe.expected_churn_expiry_hit_last = (
+                    expected_summary.expiry_window_hit
+                )
+
+                if not _should_apply_refresh(
+                    added,
+                    removed,
+                    config.capture_universe_refresh_min_delta_tokens,
+                ):
+                    state.universe.refresh_skipped_delta_below_min_count += 1
+                    state.universe.shards_refreshed_last = 0
+                    state.universe.refresh_last_decision_reason = "SKIPPED_DELTA_BELOW_MIN"
+                    state.universe.refresh_inflight_future = None
+                    state.universe.refresh_inflight_started_mono_ns = None
+                    continue
+                guard_triggered = (
+                    churn_pct > config.capture_universe_refresh_max_churn_pct
+                )
+                bypass_guard = guard_triggered and expected_summary.expected_churn
+                if bypass_guard:
+                    state.universe.refresh_last_decision_reason = "BYPASSED_EXPECTED_CHURN"
+                    guard_triggered = False
+                (
+                    next_interval,
+                    next_guard_count,
+                    guard_fatal,
+                ) = _apply_churn_guard_policy(
+                    state.universe.effective_refresh_interval_seconds,
+                    baseline_interval,
+                    config.capture_universe_refresh_max_interval_seconds,
+                    guard_triggered=guard_triggered,
+                    guard_count=state.universe.refresh_churn_guard_count,
+                    fatal_threshold=config.capture_universe_refresh_churn_guard_consecutive_fatal,
+                )
+                state.universe.effective_refresh_interval_seconds = next_interval
+                state.universe.refresh_churn_guard_count = next_guard_count
+                if guard_triggered:
+                    state.universe.shards_refreshed_last = 0
+                    state.universe.refresh_last_decision_reason = "SKIPPED_CHURN_GUARD"
+                    _write_runlog(
+                        run_dir,
+                        {
+                            "record_type": "universe_refresh",
+                            "run_id": state.run.run_id,
+                            "universe_version": snapshot.universe_version,
+                            "added_count": len(added),
+                            "removed_count": len(removed),
+                            "churn_pct": churn_pct,
+                            "interval_seconds_used": state.universe.effective_refresh_interval_seconds,
+                            "added_sample": sorted(added)[:10],
+                            "removed_sample": sorted(removed)[:10],
+                            "reason": "CHURN_GUARD",
+                            "duration_ms": duration_ms,
+                            "gamma_pages_fetched": plan.gamma_pages_fetched,
+                            "markets_seen": plan.markets_seen,
+                            "tokens_selected": plan.tokens_selected,
+                        },
+                    )
+                    if guard_fatal:
+                        await _trigger_fatal(
+                            state,
+                            FATAL_CHURN_GUARD,
+                            "churn guard sustained",
+                        )
+                        break
+                    state.universe.refresh_inflight_future = None
+                    state.universe.refresh_inflight_started_mono_ns = None
+                    continue
+                if not bypass_guard:
+                    state.universe.refresh_last_decision_reason = "APPLIED"
+
+                next_targets = _materialize_shard_targets(plan.shard_targets)
+                changed_targets = _select_changed_shards(
+                    state.universe.shard_targets, next_targets
+                )
+
                 _write_runlog(
                     run_dir,
                     {
@@ -1815,121 +2626,120 @@ async def _refresh_loop(state: CaptureState) -> None:
                         "interval_seconds_used": state.universe.effective_refresh_interval_seconds,
                         "added_sample": sorted(added)[:10],
                         "removed_sample": sorted(removed)[:10],
-                        "reason": "CHURN_GUARD",
+                        "reason": "APPLIED",
+                        "duration_ms": duration_ms,
+                        "gamma_pages_fetched": plan.gamma_pages_fetched,
+                        "markets_seen": plan.markets_seen,
+                        "tokens_selected": plan.tokens_selected,
                     },
                 )
-                if guard_fatal:
-                    await _trigger_fatal(
-                        state,
-                        FATAL_CHURN_GUARD,
-                        "churn guard sustained",
-                    )
-                    break
-                continue
-            if not bypass_guard:
-                state.universe.refresh_last_decision_reason = "APPLIED"
 
-            scores = _token_score_map(selected_markets)
-            ordered_tokens = _sorted_unique_tokens(snapshot.token_ids)
-            next_targets = _build_shard_targets(
-                ordered_tokens,
-                config,
-                target_version=snapshot.universe_version,
-                scores=scores,
-            )
-            changed_targets = _select_changed_shards(
-                state.universe.shard_targets, next_targets
-            )
+                state.universe.universe_version = snapshot.universe_version
+                state.universe.refresh_count += 1
+                state.universe.shards_refreshed_last = len(changed_targets)
+                state.universe.current_token_ids = desired_tokens
+                state.universe.current_market_ids = desired_market_ids
+                state.universe.segment_by_token_id = plan.segment_by_token_id
+                state.universe.segment_by_market_id = plan.segment_by_market_id
+                state.universe.policy_counts_last = plan.policy_counts
+                now_ns = monotonic_ns()
+                for token_id in added:
+                    state.universe.token_added_mono_ns[token_id] = now_ns
+                for token_id in removed:
+                    state.universe.token_added_mono_ns.pop(token_id, None)
+                state.pinned_tokens = plan.ordered_tokens
+                if removed:
+                    for shard in state.shards:
+                        for token_id in removed:
+                            shard.last_seen.pop(token_id, None)
 
-            _write_runlog(
-                run_dir,
-                {
-                    "record_type": "universe_refresh",
-                    "run_id": state.run.run_id,
-                    "universe_version": snapshot.universe_version,
-                    "added_count": len(added),
-                    "removed_count": len(removed),
-                    "churn_pct": churn_pct,
-                    "interval_seconds_used": state.universe.effective_refresh_interval_seconds,
-                    "added_sample": sorted(added)[:10],
-                    "removed_sample": sorted(removed)[:10],
-                    "reason": "APPLIED",
-                },
-            )
-
-            state.universe.universe_version = snapshot.universe_version
-            state.universe.refresh_count += 1
-            state.universe.shards_refreshed_last = len(changed_targets)
-            state.universe.current_token_ids = desired_tokens
-            state.universe.current_market_ids = desired_market_ids
-            state.universe.segment_by_token_id = next_segment_by_token
-            state.universe.segment_by_market_id = next_segment_by_market
-            if policy_selector is not None:
-                state.universe.policy_counts_last = policy_counts(
-                    policy_selector, next_segment_by_token
+                for shard_id, next_target in next_targets.items():
+                    if (
+                        state.universe.refresh_cancelled
+                        or state.fatal_event.is_set()
+                        or state.stop_event.is_set()
+                    ):
+                        break
+                    current = state.universe.shard_targets.get(shard_id)
+                    if current is None:
+                        state.universe.shard_targets[shard_id] = next_target
+                        current = next_target
+                    if shard_id in changed_targets:
+                        _write_runlog(
+                            run_dir,
+                            {
+                                "record_type": "shard_refresh_begin",
+                                "run_id": state.run.run_id,
+                                "shard_id": shard_id,
+                                "from_version": current.target_version,
+                                "to_version": snapshot.universe_version,
+                                "from_token_count": len(current.token_ids),
+                                "to_token_count": len(next_target.token_ids),
+                            },
+                        )
+                        current.token_ids = next_target.token_ids
+                        current.groups = next_target.groups
+                        current.confirm_token_ids = next_target.confirm_token_ids
+                        current.target_version = snapshot.universe_version
+                        current.refresh_requested.set()
+                        await asyncio.sleep(config.capture_universe_refresh_stagger_seconds)
+                    else:
+                        current.target_version = snapshot.universe_version
+                state.universe.refresh_inflight_future = None
+                state.universe.refresh_inflight_started_mono_ns = None
+            except asyncio.TimeoutError:
+                state.universe.refresh_failures += 1
+                state.universe.refresh_last_decision_reason = "ERROR"
+                if state.universe.refresh_inflight_started_mono_ns is not None:
+                    state.universe.refresh_duration_ms_last = (
+                        monotonic_ns() - state.universe.refresh_inflight_started_mono_ns
+                    ) / 1_000_000.0
+                state.universe.refresh_inflight_timed_out = True
+                _write_runlog(
+                    run_dir,
+                    {
+                        "record_type": "universe_refresh_error",
+                        "run_id": state.run.run_id,
+                        "error": "TimeoutError",
+                        "message": "refresh timeout",
+                        "duration_ms": state.universe.refresh_duration_ms_last,
+                    },
                 )
-            now_ns = monotonic_ns()
-            for token_id in added:
-                state.universe.token_added_mono_ns[token_id] = now_ns
-            for token_id in removed:
-                state.universe.token_added_mono_ns.pop(token_id, None)
-            state.pinned_tokens = ordered_tokens
-            if removed:
-                for shard in state.shards:
-                    for token_id in removed:
-                        shard.last_seen.pop(token_id, None)
-
-            for shard_id, next_target in next_targets.items():
-                if (
-                    state.universe.refresh_cancelled
-                    or state.fatal_event.is_set()
-                    or state.stop_event.is_set()
-                ):
-                    break
-                current = state.universe.shard_targets.get(shard_id)
-                if current is None:
-                    state.universe.shard_targets[shard_id] = next_target
-                    current = next_target
-                if shard_id in changed_targets:
-                    _write_runlog(
-                        run_dir,
-                        {
-                            "record_type": "shard_refresh_begin",
-                            "run_id": state.run.run_id,
-                            "shard_id": shard_id,
-                            "from_version": current.target_version,
-                            "to_version": snapshot.universe_version,
-                            "from_token_count": len(current.token_ids),
-                            "to_token_count": len(next_target.token_ids),
-                        },
-                    )
-                    current.token_ids = next_target.token_ids
-                    current.groups = next_target.groups
-                    current.confirm_token_ids = next_target.confirm_token_ids
-                    current.target_version = snapshot.universe_version
-                    current.refresh_requested.set()
-                    await asyncio.sleep(config.capture_universe_refresh_stagger_seconds)
-                else:
-                    current.target_version = snapshot.universe_version
-        except asyncio.CancelledError:
-            state.universe.refresh_cancelled = True
-            break
-        except Exception as exc:
-            state.universe.refresh_failures += 1
-            state.universe.refresh_last_decision_reason = "ERROR"
-            _write_runlog(
-                run_dir,
-                {
-                    "record_type": "universe_refresh_error",
-                    "run_id": state.run.run_id,
-                    "error": type(exc).__name__,
-                    "message": str(exc),
-                },
-            )
+            except asyncio.CancelledError:
+                state.universe.refresh_cancelled = True
+                break
+            except Exception as exc:
+                state.universe.refresh_failures += 1
+                state.universe.refresh_last_decision_reason = "ERROR"
+                if state.universe.refresh_inflight_started_mono_ns is not None:
+                    state.universe.refresh_duration_ms_last = (
+                        monotonic_ns() - state.universe.refresh_inflight_started_mono_ns
+                    ) / 1_000_000.0
+                _write_runlog(
+                    run_dir,
+                    {
+                        "record_type": "universe_refresh_error",
+                        "run_id": state.run.run_id,
+                        "error": type(exc).__name__,
+                        "message": str(exc),
+                        "duration_ms": state.universe.refresh_duration_ms_last,
+                    },
+                )
+                state.universe.refresh_inflight_future = None
+                state.universe.refresh_inflight_started_mono_ns = None
+    finally:
+        inflight = state.universe.refresh_inflight_future
+        if state.refresh_worker is not None and (inflight is None or inflight.done()):
+            state.refresh_worker.close()
+            state.refresh_worker = None
+        if state.refresh_executor is not None:
+            state.refresh_executor.shutdown(wait=False, cancel_futures=True)
+            state.refresh_executor = None
 
 
 async def _run_shard(state: CaptureState, shard: ShardState) -> None:
     run_dir = state.run.run_dir
+    yield_interval_ns = 5_000_000
     while not state.fatal_event.is_set() and not state.stop_event.is_set():
         if not shard.token_ids:
             await _wait_for_refresh_or_fatal(state, shard)
@@ -2061,6 +2871,9 @@ async def _run_shard(state: CaptureState, shard: ShardState) -> None:
                         rx_mono_ns=rx_mono_ns,
                         rx_wall_ns_utc=rx_wall_ns_utc,
                     )
+                    if rx_mono_ns - shard.last_yield_mono_ns >= yield_interval_ns:
+                        shard.last_yield_mono_ns = rx_mono_ns
+                        await asyncio.sleep(0)
             if refresh_applied:
                 continue
         except Exception as exc:
@@ -2170,6 +2983,7 @@ async def _capture_online_async(config: Config, run_id: str | None = None) -> in
         "universe_refresh": {
             "enabled": config.capture_universe_refresh_enable,
             "interval_seconds": config.capture_universe_refresh_interval_seconds,
+            "timeout_seconds": config.capture_universe_refresh_timeout_seconds,
             "stagger_seconds": config.capture_universe_refresh_stagger_seconds,
             "grace_seconds": config.capture_universe_refresh_grace_seconds,
             "min_delta_tokens": config.capture_universe_refresh_min_delta_tokens,
@@ -2193,6 +3007,9 @@ async def _capture_online_async(config: Config, run_id: str | None = None) -> in
     run = bootstrap_run(config, run_id=run_id, manifest_extra=manifest_extra)
     run_dir = run.run_dir
     print(f"capture run dir: {run_dir}")
+    io_writer = _NdjsonWriter()
+    global _IO_WRITER
+    _IO_WRITER = io_writer
 
     precision = _monotonic_precision_stats(sample_count=200)
     _write_runlog(
@@ -2210,6 +3027,8 @@ async def _capture_online_async(config: Config, run_id: str | None = None) -> in
             "monotonic clock precision insufficient",
             extra={"monotonic_precision": precision},
         )
+        io_writer.close()
+        _IO_WRITER = None
         return 1
     shards: list[ShardState] = []
     for shard_id, target in shard_targets.items():
@@ -2254,6 +3073,15 @@ async def _capture_online_async(config: Config, run_id: str | None = None) -> in
         policy_selector=policy_selector,
         fee_regime_monitor=fee_regime_monitor,
     )
+    state.io_writer = io_writer
+    state.parse_worker = _ParseWorker()
+    state.frame_writer = _FrameWriter(
+        shards=shards,
+        schema_version=config.capture_frames_schema_version,
+    )
+    if config.capture_gc_disable and gc.isenabled():
+        gc.disable()
+        state.gc_was_enabled = True
     _install_signal_handlers(state)
     _write_runlog(
         run_dir,
@@ -2269,6 +3097,12 @@ async def _capture_online_async(config: Config, run_id: str | None = None) -> in
     tasks = [asyncio.create_task(_run_shard(state, shard)) for shard in shards]
     heartbeat_task = asyncio.create_task(_heartbeat_loop(state))
     tasks.append(heartbeat_task)
+    lag_task = asyncio.create_task(_loop_lag_monitor(state))
+    tasks.append(lag_task)
+    parse_task = asyncio.create_task(_parse_results_loop(state))
+    tasks.append(parse_task)
+    write_task = asyncio.create_task(_write_results_loop(state))
+    tasks.append(write_task)
     if config.capture_universe_refresh_enable:
         refresh_task = asyncio.create_task(_refresh_loop(state))
         state.universe.refresh_task = refresh_task
@@ -2302,6 +3136,10 @@ async def _capture_online_async(config: Config, run_id: str | None = None) -> in
         with contextlib.suppress(asyncio.CancelledError):
             await task
 
+    if state.frame_writer is not None:
+        state.frame_writer.close()
+        state.frame_writer = None
+
     for shard in shards:
         shard.frames_fh.flush()
         shard.idx_fh.flush()
@@ -2309,6 +3147,18 @@ async def _capture_online_async(config: Config, run_id: str | None = None) -> in
         os.fsync(shard.idx_fh.fileno())
         shard.frames_fh.close()
         shard.idx_fh.close()
+
+    if state.parse_worker is not None:
+        state.parse_worker.close()
+        state.parse_worker = None
+
+    if state.io_writer is not None:
+        state.io_writer.close()
+        state.io_writer = None
+        _IO_WRITER = None
+
+    if state.gc_was_enabled:
+        gc.enable()
 
     return 1 if state.fatal_event.is_set() else 0
 

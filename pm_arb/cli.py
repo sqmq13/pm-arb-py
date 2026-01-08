@@ -18,7 +18,7 @@ except ImportError:
 
 from .config import Config
 from .capture_offline import quantile, run_capture_offline
-from .capture_inspect import inspect_run
+from .capture_inspect import audit_heartbeat_gaps, inspect_run
 from .capture_online import run_capture_online
 from .capture_format import verify_frames
 from .capture_slice import slice_run
@@ -136,6 +136,10 @@ def main(argv: list[str] | None = None) -> int:
     capture_inspect = subparsers.add_parser("capture-inspect", parents=[common])
     capture_inspect.add_argument("--run-dir", required=True)
 
+    capture_audit = subparsers.add_parser("capture-audit", parents=[common])
+    capture_audit.add_argument("--run-dir", required=True)
+    capture_audit.add_argument("--threshold-seconds", type=float, default=2.0)
+
     capture_slice = subparsers.add_parser("capture-slice", parents=[common])
     capture_slice.add_argument("--run-dir", required=True)
     capture_slice.add_argument("--out-dir", default=None)
@@ -239,6 +243,17 @@ def main(argv: list[str] | None = None) -> int:
             print(str(exc), file=sys.stderr)
             return 2
         print(json.dumps(summary.payload, ensure_ascii=True, separators=(",", ":")))
+        return 0
+    if args.command == "capture-audit":
+        try:
+            summary = audit_heartbeat_gaps(
+                Path(args.run_dir),
+                threshold_seconds=args.threshold_seconds,
+            )
+        except Exception as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+        print(json.dumps(summary, ensure_ascii=True, separators=(",", ":")))
         return 0
     if args.command == "capture-slice":
         try:

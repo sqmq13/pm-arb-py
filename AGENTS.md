@@ -48,4 +48,3 @@ Keep diffs tight; do not change unrelated code.
 
 - `make test` (fallback: `uv run python -m pytest`).
 - `uv run pm_arb capture-bench --offline --fixtures-dir testdata/fixtures`.
-- Run the string-hygiene gate from the task checklist.

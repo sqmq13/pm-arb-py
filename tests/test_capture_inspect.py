@@ -1,6 +1,7 @@
+import json
 from pathlib import Path
 
-from pm_arb.capture_inspect import inspect_run
+from pm_arb.capture_inspect import audit_heartbeat_gaps, inspect_run
 from pm_arb.capture_offline import run_capture_offline
 from pm_arb.config import Config
 
@@ -23,3 +24,25 @@ def test_capture_inspect_summary(tmp_path: Path) -> None:
     shard = payload["shards"]["by_shard"]["shard_00"]
     assert shard["rx_wall_ns_utc_first"] is not None
     assert shard["rx_wall_ns_utc_last"] is not None
+
+
+def test_audit_heartbeat_gaps(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    runlog_path = run_dir / "runlog.ndjson"
+    records = [
+        {"record_type": "run_start", "run_id": "run"},
+        {"record_type": "heartbeat", "hb_mono_ns": 0},
+        {"record_type": "universe_refresh", "reason": "APPLIED"},
+        {"record_type": "heartbeat", "hb_mono_ns": 3_000_000_000},
+        {"record_type": "heartbeat", "hb_mono_ns": 4_000_000_000},
+    ]
+    runlog_path.write_text(
+        "\n".join(json.dumps(record, separators=(",", ":")) for record in records) + "\n",
+        encoding="utf-8",
+    )
+    summary = audit_heartbeat_gaps(run_dir, threshold_seconds=2.0)
+    assert summary["hb_count"] == 3
+    assert summary["gaps_over_threshold"] == 1
+    assert summary["max_gap_seconds"] == 3.0
+    assert summary["max_gap"]["record_types_between"]["universe_refresh"] == 1
