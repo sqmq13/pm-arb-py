@@ -167,6 +167,9 @@ def _write_heartbeat(
     run_id: str,
     hb_wall_ns_utc: int,
     hb_mono_ns: int,
+    *,
+    fsync_on_close: bool,
+    fsync_interval_seconds: float | None,
 ) -> None:
     record = {
         "record_type": "heartbeat",
@@ -174,7 +177,12 @@ def _write_heartbeat(
         "hb_wall_ns_utc": hb_wall_ns_utc,
         "hb_mono_ns": hb_mono_ns,
     }
-    _append_ndjson(run_dir / "runlog.ndjson", record)
+    _append_ndjson(
+        run_dir / "runlog.ndjson",
+        record,
+        fsync_on_close=fsync_on_close,
+        fsync_interval_seconds=fsync_interval_seconds,
+    )
 
 
 def _write_metrics(
@@ -184,6 +192,9 @@ def _write_metrics(
     stats: CaptureStats,
     elapsed_ns: int,
     pinned_tokens: set[str],
+    *,
+    fsync_on_close: bool,
+    fsync_interval_seconds: float | None,
 ) -> None:
     elapsed_sec = max(elapsed_ns / 1_000_000_000.0, 1e-9)
     coverage_pct = 0.0
@@ -209,7 +220,12 @@ def _write_metrics(
     }
     if shard_id is not None:
         record["shard_id"] = shard_id
-    _append_ndjson(metrics_path, record)
+    _append_ndjson(
+        metrics_path,
+        record,
+        fsync_on_close=fsync_on_close,
+        fsync_interval_seconds=fsync_interval_seconds,
+    )
 
 
 def run_capture_offline(
@@ -230,6 +246,8 @@ def run_capture_offline(
         "fixtures_dir": str(fixtures_dir),
         "fixtures_multiplier": multiplier,
         "pinned_token_ids": sorted(pinned_tokens),
+        "ndjson_fsync_on_close": config.capture_ndjson_fsync_on_close,
+        "ndjson_fsync_interval_seconds": config.capture_ndjson_fsync_interval_seconds,
     }
     run = bootstrap_run(config, run_id=run_id, manifest_extra=manifest_extra)
     run_dir = run.run_dir
@@ -273,10 +291,41 @@ def run_capture_offline(
                 now_ns = write_end_ns
                 if emit_metrics and now_ns >= next_heartbeat_ns:
                     hb_wall_ns_utc = time.time_ns()
-                    _write_heartbeat(run_dir, run.run_id, hb_wall_ns_utc, now_ns)
+                    _write_heartbeat(
+                        run_dir,
+                        run.run_id,
+                        hb_wall_ns_utc,
+                        now_ns,
+                        fsync_on_close=config.capture_ndjson_fsync_on_close,
+                        fsync_interval_seconds=(
+                            config.capture_ndjson_fsync_interval_seconds
+                        ),
+                    )
                     elapsed_ns = now_ns - start_mono_ns
-                    _write_metrics(metrics_global, run.run_id, None, stats, elapsed_ns, pinned_tokens)
-                    _write_metrics(metrics_shard, run.run_id, 0, stats, elapsed_ns, pinned_tokens)
+                    _write_metrics(
+                        metrics_global,
+                        run.run_id,
+                        None,
+                        stats,
+                        elapsed_ns,
+                        pinned_tokens,
+                        fsync_on_close=config.capture_ndjson_fsync_on_close,
+                        fsync_interval_seconds=(
+                            config.capture_ndjson_fsync_interval_seconds
+                        ),
+                    )
+                    _write_metrics(
+                        metrics_shard,
+                        run.run_id,
+                        0,
+                        stats,
+                        elapsed_ns,
+                        pinned_tokens,
+                        fsync_on_close=config.capture_ndjson_fsync_on_close,
+                        fsync_interval_seconds=(
+                            config.capture_ndjson_fsync_interval_seconds
+                        ),
+                    )
                     next_heartbeat_ns = now_ns + 1_000_000_000
         frames_fh.flush()
         idx_fh.flush()
@@ -286,8 +335,33 @@ def run_capture_offline(
     end_mono_ns = monotonic_ns()
     elapsed_ns = end_mono_ns - start_mono_ns
     hb_wall_ns_utc = time.time_ns()
-    _write_heartbeat(run_dir, run.run_id, hb_wall_ns_utc, end_mono_ns)
+    _write_heartbeat(
+        run_dir,
+        run.run_id,
+        hb_wall_ns_utc,
+        end_mono_ns,
+        fsync_on_close=config.capture_ndjson_fsync_on_close,
+        fsync_interval_seconds=config.capture_ndjson_fsync_interval_seconds,
+    )
     if emit_metrics:
-        _write_metrics(metrics_global, run.run_id, None, stats, elapsed_ns, pinned_tokens)
-        _write_metrics(metrics_shard, run.run_id, 0, stats, elapsed_ns, pinned_tokens)
+        _write_metrics(
+            metrics_global,
+            run.run_id,
+            None,
+            stats,
+            elapsed_ns,
+            pinned_tokens,
+            fsync_on_close=config.capture_ndjson_fsync_on_close,
+            fsync_interval_seconds=config.capture_ndjson_fsync_interval_seconds,
+        )
+        _write_metrics(
+            metrics_shard,
+            run.run_id,
+            0,
+            stats,
+            elapsed_ns,
+            pinned_tokens,
+            fsync_on_close=config.capture_ndjson_fsync_on_close,
+            fsync_interval_seconds=config.capture_ndjson_fsync_interval_seconds,
+        )
     return CaptureRunResult(run, stats, elapsed_ns, shard_id=0, pinned_tokens=pinned_tokens)

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, fields
-from typing import Any
+import types
+import typing
+from typing import Any, get_args, get_origin
 
 ENV_PREFIX = "PM_ARB_"
 
@@ -23,12 +25,37 @@ def _parse_number(value: str, target_type: type) -> Any:
     return value
 
 
-def _is_field_type(field_type, expected: type, expected_name: str) -> bool:
-    if field_type is expected:
+def _unwrap_optional(field_type: Any) -> tuple[Any, bool]:
+    origin = get_origin(field_type)
+    union_type = getattr(types, "UnionType", None)
+    if origin not in (typing.Union, union_type):
+        return field_type, False
+    args = get_args(field_type)
+    if args and type(None) in args and len(args) == 2:
+        base = args[0] if args[1] is type(None) else args[1]
+        return base, True
+    return field_type, False
+
+
+def _is_field_type(field_type: Any, expected: type, expected_name: str) -> bool:
+    base_type, _is_optional = _unwrap_optional(field_type)
+    if base_type is expected:
         return True
-    if isinstance(field_type, str) and field_type == expected_name:
+    if isinstance(base_type, str) and base_type == expected_name:
         return True
     return False
+
+
+def _parse_optional(raw: str, target_type: type) -> Any:
+    text = str(raw).strip()
+    if text == "":
+        return None
+    lower = text.lower()
+    if lower in {"none", "null"}:
+        return None
+    if target_type is bool:
+        return _parse_bool(text)
+    return _parse_number(text, target_type)
 
 
 @dataclass
@@ -45,8 +72,9 @@ class Config:
     ws_ping_interval_seconds: float = 10.0
     ws_ping_timeout_seconds: float = 10.0
     ws_data_idle_reconnect_seconds: float = 120.0
+    ws_user_agent: str = "pm_arb"
     capture_frames_schema_version: int = 2
-    capture_max_markets: int = 2000
+    capture_max_markets: int | None = 2000
     capture_confirm_tokens_per_shard: int = 25
     capture_confirm_timeout_seconds: float = 45.0
     capture_confirm_min_events: int = 1
@@ -54,6 +82,9 @@ class Config:
     capture_backpressure_fatal_ms: float = 250.0
     capture_ring_buffer_frames: int = 4096
     capture_metrics_max_samples: int = 5000
+    capture_runlog_enqueue_timeout_seconds: float = 1.0
+    capture_ndjson_fsync_on_close: bool = False
+    capture_ndjson_fsync_interval_seconds: float | None = None
     capture_heartbeat_interval_seconds: float = 1.0
     capture_gc_disable: bool = True
     capture_universe_refresh_enable: bool = True
@@ -88,14 +119,20 @@ class Config:
     policy_default_id: str = "default"
     policy_rules_json: str = "[]"
     data_dir: str = "./data"
-    min_free_disk_gb: int = 5
+    min_free_disk_gb: int | None = 5
     offline: bool = False
 
     def apply_overrides(self, overrides: dict[str, Any]) -> "Config":
         for field in fields(self):
             name = field.name
-            if name in overrides and overrides[name] is not None:
-                setattr(self, name, overrides[name])
+            if name in overrides:
+                value = overrides[name]
+                if value is None:
+                    _base_type, is_optional = _unwrap_optional(field.type)
+                    if is_optional:
+                        setattr(self, name, None)
+                    continue
+                setattr(self, name, value)
         return self
 
     @classmethod
@@ -106,7 +143,10 @@ class Config:
             if env_key not in env:
                 continue
             raw = env[env_key]
-            if _is_field_type(field.type, bool, "bool"):
+            base_type, is_optional = _unwrap_optional(field.type)
+            if is_optional:
+                value = _parse_optional(raw, base_type)
+            elif _is_field_type(field.type, bool, "bool"):
                 value = _parse_bool(raw)
             elif _is_field_type(field.type, int, "int"):
                 value = _parse_number(raw, int)

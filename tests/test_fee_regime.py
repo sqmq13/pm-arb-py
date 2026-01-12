@@ -129,7 +129,7 @@ async def test_fee_regime_trip_surfaces_in_metrics(tmp_path, monkeypatch):
     )
     captured = {}
 
-    def fake_write_metrics(path, record):
+    def fake_write_metrics(_state, path, record):
         if path.name == "global.ndjson":
             captured["record"] = record
             state.fatal_event.set()
@@ -143,3 +143,4 @@ async def test_fee_regime_trip_surfaces_in_metrics(tmp_path, monkeypatch):
 
     shard.frames_fh.close()
     shard.idx_fh.close()
+

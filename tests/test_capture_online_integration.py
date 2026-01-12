@@ -102,7 +102,7 @@ async def test_refresh_integration_changed_shard_and_grace(tmp_path, monkeypatch
             token_ids=new_tokens,
             created_wall_ns_utc=1,
             created_mono_ns=1,
-            selection={"max_markets": 1, "filters_enabled": False},
+            selection={"max_markets": 1},
         )
 
     monkeypatch.setattr("pm_arb.capture_online.compute_desired_universe", fake_compute)
@@ -144,3 +144,4 @@ async def test_refresh_integration_changed_shard_and_grace(tmp_path, monkeypatch
     for shard in shards:
         shard.frames_fh.close()
         shard.idx_fh.close()
+

@@ -16,6 +16,7 @@ class PlaceOrderIntent:
     max_slippage_bps: int | None
     tag: str
     expires_at: int | None
+    strategy_id: str | None = None
 
 
 @dataclass(slots=True)
@@ -24,6 +25,7 @@ class CancelIntent:
     market_id: str | None
     tag: str | None
     reason: str
+    strategy_id: str | None = None
 
 
 Intent = PlaceOrderIntent | CancelIntent

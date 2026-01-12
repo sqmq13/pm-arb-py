@@ -84,12 +84,11 @@ def test_compute_desired_universe_orders_and_filters(monkeypatch):
     assert snapshot.market_ids == ["10", "9"]
     assert snapshot.token_ids == ["a", "b", "i", "j"]
     assert snapshot.selection["max_markets"] == 2
-    assert snapshot.selection["filters_enabled"] is False
     assert snapshot.created_wall_ns_utc > 0
     assert snapshot.created_mono_ns > 0
 
 
-def test_compute_desired_universe_preserves_order_non_numeric_ids(monkeypatch):
+def test_compute_desired_universe_sorts_non_numeric_ids(monkeypatch):
     markets = [
         {"id": "b", "active": True, "enableOrderBook": True, "clobTokenIds": ["a", "b"]},
         {"id": "a", "active": True, "enableOrderBook": True, "clobTokenIds": ["c", "d"]},
@@ -101,4 +100,6 @@ def test_compute_desired_universe_preserves_order_non_numeric_ids(monkeypatch):
     monkeypatch.setattr(gamma, "fetch_markets", fake_fetch)
     config = Config(capture_max_markets=10)
     snapshot = gamma.compute_desired_universe(config)
-    assert snapshot.market_ids == ["b", "a"]
+    assert snapshot.market_ids == ["a", "b"]
+
+

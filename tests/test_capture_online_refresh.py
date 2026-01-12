@@ -139,7 +139,7 @@ def test_startup_selection_uses_snapshot(monkeypatch):
         token_ids=["t3", "t4", "t1", "t2"],
         created_wall_ns_utc=1,
         created_mono_ns=2,
-        selection={"max_markets": 10, "filters_enabled": False},
+        selection={"max_markets": 10},
     )
 
     def fake_compute(_cfg, *, universe_version=0, **_kwargs):
@@ -221,7 +221,7 @@ async def test_refresh_noop_does_not_reconnect(tmp_path, monkeypatch):
         token_ids=list(tokens),
         created_wall_ns_utc=1,
         created_mono_ns=2,
-        selection={"max_markets": 10, "filters_enabled": False},
+        selection={"max_markets": 10},
         selected_markets=[],
     )
 
@@ -316,7 +316,7 @@ async def test_refresh_skip_below_min_updates_metrics(tmp_path, monkeypatch):
         token_ids=["t1", "t2", "t3"],
         created_wall_ns_utc=1,
         created_mono_ns=2,
-        selection={"max_markets": 10, "filters_enabled": False},
+        selection={"max_markets": 10},
         selected_markets=[],
     )
 
@@ -334,7 +334,7 @@ async def test_refresh_skip_below_min_updates_metrics(tmp_path, monkeypatch):
 
     captured: dict[str, dict[str, str | int]] = {}
 
-    def fake_write_metrics(path, record):
+    def fake_write_metrics(_state, path, record):
         if path.name == "global.ndjson":
             captured["record"] = record
             state.fatal_event.set()
@@ -423,7 +423,7 @@ async def test_expected_churn_bypasses_guard(tmp_path, monkeypatch):
         token_ids=["t3", "t4"],
         created_wall_ns_utc=1,
         created_mono_ns=2,
-        selection={"max_markets": 10, "filters_enabled": False},
+        selection={"max_markets": 10},
         selected_markets=[new_market],
     )
 
@@ -522,7 +522,7 @@ async def test_refresh_worker_does_not_block_heartbeat(tmp_path, monkeypatch):
         token_ids=["t1", "t2", "t3", "t4"],
         created_wall_ns_utc=1,
         created_mono_ns=2,
-        selection={"max_markets": 10, "filters_enabled": False},
+        selection={"max_markets": 10},
         selected_markets=markets,
     )
 
@@ -578,7 +578,7 @@ async def test_refresh_worker_does_not_block_heartbeat(tmp_path, monkeypatch):
 
     records: list[dict[str, float]] = []
 
-    def fake_write_metrics(path, record):
+    def fake_write_metrics(_state, path, record):
         if path.name == "global.ndjson":
             records.append(record)
             if len(records) >= 6:
@@ -604,3 +604,5 @@ async def test_refresh_worker_does_not_block_heartbeat(tmp_path, monkeypatch):
 
     shard.frames_fh.close()
     shard.idx_fh.close()
+
+

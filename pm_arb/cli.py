@@ -5,6 +5,8 @@ import asyncio
 import json
 import os
 import sys
+import types
+import typing
 from dataclasses import fields
 from pathlib import Path
 from typing import Any
@@ -23,13 +25,26 @@ from .capture_online import run_capture_online
 from .capture_format import verify_frames
 from .capture_slice import slice_run
 from .gamma import fetch_markets, select_active_binary_markets
-from .runtime.entrypoint import format_run_summary, run_live_sim, run_replay_sim
+from .runtime.entrypoint import RunSummary, format_run_summary, run_live_sim, run_replay_sim
 
 
-def _is_field_type(field_type, expected: type, expected_name: str) -> bool:
-    if field_type is expected:
+def _unwrap_optional(field_type: Any) -> tuple[Any, bool]:
+    origin = typing.get_origin(field_type)
+    union_type = getattr(types, "UnionType", None)
+    if origin not in (typing.Union, union_type):
+        return field_type, False
+    args = typing.get_args(field_type)
+    if args and type(None) in args and len(args) == 2:
+        base = args[0] if args[1] is type(None) else args[1]
+        return base, True
+    return field_type, False
+
+
+def _is_field_type(field_type: Any, expected: type, expected_name: str) -> bool:
+    base_type, _is_optional = _unwrap_optional(field_type)
+    if base_type is expected:
         return True
-    if isinstance(field_type, str) and field_type == expected_name:
+    if isinstance(base_type, str) and base_type == expected_name:
         return True
     return False
 
@@ -74,6 +89,21 @@ def _cli_overrides(ns: argparse.Namespace) -> dict[str, Any]:
     for field in fields(Config):
         value = getattr(ns, field.name, None)
         if value is None:
+            continue
+        base_type, is_optional = _unwrap_optional(field.type)
+        if is_optional:
+            text = str(value).strip()
+            if text == "" or text.lower() in {"none", "null"}:
+                overrides[field.name] = None
+                continue
+            if base_type is bool:
+                overrides[field.name] = _str2bool(text)
+            elif base_type is int:
+                overrides[field.name] = int(text)
+            elif base_type is float:
+                overrides[field.name] = float(text)
+            else:
+                overrides[field.name] = value
             continue
         if _is_field_type(field.type, bool, "bool"):
             overrides[field.name] = _str2bool(value)
@@ -164,14 +194,10 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("--max-events", type=int, default=None)
     run.add_argument("--duration-seconds", type=float, default=None)
     run.add_argument("--strategy", action="append", default=None)
-    run.add_argument("--seed", type=int, default=None)
-    run.add_argument("--config", dest="runtime_config", default=None)
     run.add_argument("--print-hash", action="store_true", default=False)
     run.add_argument("--print-pnl", action="store_true", default=False)
     run.add_argument("--print-summary-json", action="store_true", default=False)
     run.add_argument("--stable-json", action="store_true", default=False)
-    run.add_argument("--quiet", action="store_true", default=False)
-    run.add_argument("--json", action="store_true", default=False)
 
     args = parser.parse_args(argv)
     overrides = _cli_overrides(args)
@@ -304,16 +330,13 @@ def main(argv: list[str] | None = None) -> int:
         print(f"slice dir: {result.slice_dir}")
         return 0
     if args.command == "run":
+        stable_json = args.mode == "replay" and args.stable_json
         try:
             if args.mode == "replay":
                 if not args.print_hash:
                     raise ValueError("--print-hash is required for replay mode")
                 if not args.run_dir:
                     raise ValueError("--run-dir is required for replay mode")
-                if args.stable_json is False:
-                    stable_json = False
-                else:
-                    stable_json = True
                 summary = run_replay_sim(
                     run_dir=Path(args.run_dir),
                     max_seconds=args.max_seconds,
@@ -328,7 +351,6 @@ def main(argv: list[str] | None = None) -> int:
                     raise ValueError("--duration-seconds is required for live mode")
                 if args.stable_json:
                     raise ValueError("--stable-json is only supported for replay mode")
-                stable_json = False
                 summary = run_live_sim(
                     config=config,
                     duration_seconds=args.duration_seconds,
@@ -338,17 +360,17 @@ def main(argv: list[str] | None = None) -> int:
             print(format_run_summary(summary, stable=stable_json))
             return 0 if summary.ok else 1
         except Exception as exc:
-            payload = {
-                "ok": False,
-                "mode": args.mode,
-                "execution": "sim",
-                "canonical_events": 0,
-                "intents": 0,
-                "final_hash": "",
-                "elapsed_ms": 0.0,
-                "error": str(exc),
-            }
-            print(json.dumps(payload, ensure_ascii=True, separators=(",", ":")))
+            summary = RunSummary(
+                ok=False,
+                mode=args.mode,
+                execution="sim",
+                canonical_events=0,
+                intents=0,
+                final_hash="",
+                elapsed_ms=0.0,
+                error=str(exc),
+            )
+            print(format_run_summary(summary, stable=stable_json))
             return 2
     return 1
 

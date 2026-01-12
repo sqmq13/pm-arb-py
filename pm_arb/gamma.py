@@ -47,7 +47,7 @@ def parse_clob_token_ids(value: Any) -> list[str]:
 def select_active_binary_markets(
     markets: list[dict[str, Any]],
     *,
-    max_markets: int,
+    max_markets: int | None,
 ) -> list[dict[str, Any]]:
     if max_markets is not None and max_markets <= 0:
         max_markets = None
@@ -71,16 +71,17 @@ def select_active_binary_markets(
 
 
 def _sort_markets_deterministic(markets: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    parsed: list[tuple[int, dict[str, Any]]] = []
+    parsed: list[tuple[tuple[object, ...], dict[str, Any]]] = []
     for idx, market in enumerate(markets):
         market_id = market.get("id")
         try:
             market_num = int(market_id)
+            key = (0, -market_num, idx)
         except (TypeError, ValueError):
-            return list(markets)
-        parsed.append((idx, market_num, market))
-    parsed.sort(key=lambda item: (-item[1], item[0]))
-    return [item[2] for item in parsed]
+            key = (1, str(market_id), idx)
+        parsed.append((key, market))
+    parsed.sort(key=lambda item: item[0])
+    return [item[1] for item in parsed]
 
 
 def compute_desired_universe(
@@ -122,7 +123,6 @@ def compute_desired_universe(
             token_ids.append(token_key)
     selection = {
         "max_markets": config.capture_max_markets,
-        "filters_enabled": bool(getattr(config, "capture_use_market_filters", False)),
     }
     return UniverseSnapshot(
         universe_version=universe_version,

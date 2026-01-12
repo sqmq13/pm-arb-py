@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import time
 import uuid
 from datetime import datetime, timezone
@@ -36,11 +37,35 @@ def _write_json(path: Path, payload: dict) -> None:
     path.write_text(data + "\n", encoding="utf-8")
 
 
-def _append_ndjson(path: Path, record: dict) -> None:
+_NDJSON_LAST_FSYNC: dict[str, float] = {}
+
+
+def _append_ndjson(
+    path: Path,
+    record: dict,
+    *,
+    fsync_on_close: bool = False,
+    fsync_interval_seconds: float | None = None,
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     line = json.dumps(record, ensure_ascii=True, separators=(",", ":"))
+    interval = None
+    if fsync_interval_seconds is not None and fsync_interval_seconds > 0:
+        interval = fsync_interval_seconds
     with path.open("ab") as handle:
         handle.write(line.encode("utf-8") + b"\n")
+        if fsync_on_close:
+            handle.flush()
+            os.fsync(handle.fileno())
+            if interval is not None:
+                _NDJSON_LAST_FSYNC[str(path)] = time.monotonic()
+        elif interval is not None:
+            now = time.monotonic()
+            last = _NDJSON_LAST_FSYNC.get(str(path), 0.0)
+            if now - last >= interval:
+                handle.flush()
+                os.fsync(handle.fileno())
+                _NDJSON_LAST_FSYNC[str(path)] = now
 
 
 def bootstrap_run(
@@ -72,5 +97,10 @@ def bootstrap_run(
         "ts_wall_ns_utc": t0_wall_ns_utc,
         "ts_mono_ns": t0_mono_ns,
     }
-    _append_ndjson(run_dir / "runlog.ndjson", run_start)
+    _append_ndjson(
+        run_dir / "runlog.ndjson",
+        run_start,
+        fsync_on_close=config.capture_ndjson_fsync_on_close,
+        fsync_interval_seconds=config.capture_ndjson_fsync_interval_seconds,
+    )
     return RunBootstrap(run_id, run_dir, t0_wall_ns_utc, t0_mono_ns)

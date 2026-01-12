@@ -118,6 +118,8 @@ class Orchestrator:
                 strategy_id,
             )
             if intents:
+                for intent in intents:
+                    intent.strategy_id = strategy_id
                 intents_by_strategy[strategy_id] = intents
         merged = self._allocator.merge_intents(intents_by_strategy, self._state)
         execution_events: list[ExecutionEvent] = []

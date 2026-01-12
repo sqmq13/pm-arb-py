@@ -12,17 +12,16 @@ from pm_arb.capture_format import FrameRecord
 import pm_arb.capture_online as capture_online
 from pm_arb.capture_online import (
     CaptureState,
-    KEEPALIVE_PAYLOAD,
     ShardState,
     UniverseState,
     _check_backpressure_fatal,
-    _confirm_event_from_payload,
     _handle_confirm_deadline_miss,
     _handle_payload,
     _heartbeat_loop,
     _mark_reconnecting,
 )
 from pm_arb.config import Config
+from pm_arb.ws_primitives import is_confirm_payload
 
 
 class FakeWebSocket:
@@ -143,12 +142,8 @@ async def test_silent_universe_confirm_no_warmup_fatal(tmp_path):
 
 
 def test_confirm_event_ignores_keepalive_then_confirms():
-    keepalive_confirm, keepalive_payload = _confirm_event_from_payload(b"PONG")
-    assert keepalive_confirm is False
-    assert keepalive_payload is KEEPALIVE_PAYLOAD
-    confirm, payload = _confirm_event_from_payload(b'{"event_type":"book"}')
-    assert confirm is True
-    assert isinstance(payload, dict)
+    assert is_confirm_payload(b"PONG") is False
+    assert is_confirm_payload(b'{"event_type":"book"}') is True
 
 
 @pytest.mark.asyncio
@@ -501,7 +496,7 @@ async def test_heartbeat_does_not_fatal_on_expired_confirm_deadline(tmp_path, mo
         universe=universe,
     )
 
-    def fake_write_metrics(path, record):
+    def fake_write_metrics(_state, path, record):
         state.fatal_event.set()
 
     def fail_trigger(*args, **kwargs):
@@ -618,3 +613,7 @@ def test_reconnect_clears_confirm_deadline(tmp_path):
 
     shard.frames_fh.close()
     shard.idx_fh.close()
+
+
+
+

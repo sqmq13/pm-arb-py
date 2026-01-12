@@ -13,32 +13,35 @@ import websockets
 from pm_arb.clob_ws import build_subscribe_payload
 from pm_arb.config import Config
 from pm_arb.gamma import fetch_markets, parse_clob_token_ids, select_active_binary_markets
+from pm_arb.ws_primitives import (
+    DropCounter,
+    ReconnectPolicy,
+    SUBSCRIBE_VARIANTS,
+    is_confirm_payload,
+    normalize_ws_keepalive,
+    split_subscribe_groups,
+)
 
 from .replay import RawFrame
-
-SUBSCRIBE_VARIANTS = ("A", "B", "C")
-
 
 def _monotonic_ns() -> int:
     return time.perf_counter_ns()
 
 
-def _normalize_ws_keepalive(config: Config) -> tuple[float | None, float | None, float | None]:
-    ping_interval = config.ws_ping_interval_seconds
-    if ping_interval <= 0:
-        ping_interval = None
-    ping_timeout = config.ws_ping_timeout_seconds
-    if ping_timeout <= 0:
-        ping_timeout = None
-    data_idle_reconnect = config.ws_data_idle_reconnect_seconds
-    if data_idle_reconnect <= 0:
-        data_idle_reconnect = None
-    return ping_interval, ping_timeout, data_idle_reconnect
-
-
 def _stable_hash(token_id: str) -> int:
     digest = hashlib.sha256(token_id.encode("utf-8")).digest()
     return int.from_bytes(digest[:8], "little", signed=False)
+
+CONNECT_SUPPORTS_CLOSE_TIMEOUT = (
+    "close_timeout" in inspect.signature(websockets.connect).parameters
+)
+CONNECT_HEADERS_PARAM: str | None
+if "extra_headers" in inspect.signature(websockets.connect).parameters:
+    CONNECT_HEADERS_PARAM = "extra_headers"
+elif "additional_headers" in inspect.signature(websockets.connect).parameters:
+    CONNECT_HEADERS_PARAM = "additional_headers"
+else:
+    CONNECT_HEADERS_PARAM = None
 
 
 def _assign_shards_by_token(token_ids: list[str], shard_count: int) -> dict[int, list[str]]:
@@ -56,39 +59,6 @@ def _assign_shards_by_token(token_ids: list[str], shard_count: int) -> dict[int,
     return shards
 
 
-def _split_subscribe_groups(
-    token_ids: list[str],
-    max_tokens: int,
-    max_bytes: int,
-    variant: str,
-) -> list[list[str]]:
-    groups: list[list[str]] = []
-    current: list[str] = []
-    for token_id in token_ids:
-        candidate = current + [token_id]
-        payload = build_subscribe_payload(variant, candidate)
-        payload_bytes = orjson.dumps(payload)
-        if len(candidate) > max_tokens or len(payload_bytes) > max_bytes:
-            if not current:
-                raise ValueError("single subscribe payload exceeds limits")
-            groups.append(current)
-            current = [token_id]
-        else:
-            current = candidate
-    if current:
-        groups.append(current)
-    return groups
-
-
-def _is_confirm_payload(payload_bytes: bytes) -> bool:
-    text = payload_bytes.strip()
-    if not text:
-        return False
-    if text.upper() in {b"PONG", b"PING"}:
-        return False
-    if text == b"[]":
-        return False
-    return True
 
 
 class _ConfirmTimeout(TimeoutError):
@@ -99,7 +69,7 @@ class _ConfirmTimeout(TimeoutError):
 class LiveStats:
     reconnects: int = 0
     frames: int = 0
-    dropped: int = 0
+    dropped: DropCounter = field(default_factory=DropCounter)
     confirm_timeouts: int = 0
 
 
@@ -190,15 +160,23 @@ class LiveDataSource:
         stop_event: asyncio.Event,
         deadline_ns: int,
     ) -> None:
-        ping_interval, ping_timeout, data_idle_reconnect = _normalize_ws_keepalive(
+        ping_interval, ping_timeout, data_idle_reconnect = normalize_ws_keepalive(
             self._config
+        )
+        reconnect_policy = ReconnectPolicy(
+            max_reconnects=self._config.ws_reconnect_max,
+            backoff_seconds=self._config.ws_reconnect_backoff_seconds,
         )
         connect_kwargs: dict[str, Any] = {
             "ping_interval": ping_interval,
             "ping_timeout": ping_timeout,
         }
-        if "close_timeout" in inspect.signature(websockets.connect).parameters:
+        if CONNECT_SUPPORTS_CLOSE_TIMEOUT:
             connect_kwargs["close_timeout"] = 5.0
+        if self._config.ws_user_agent and CONNECT_HEADERS_PARAM is not None:
+            connect_kwargs[CONNECT_HEADERS_PARAM] = [
+                ("User-Agent", self._config.ws_user_agent)
+            ]
 
         while not stop_event.is_set():
             if _monotonic_ns() >= deadline_ns:
@@ -210,7 +188,7 @@ class LiveDataSource:
                     self._config.clob_ws_url,
                     **connect_kwargs,
                 ) as ws:
-                    groups = _split_subscribe_groups(
+                    groups = split_subscribe_groups(
                         shard.token_ids,
                         max_tokens=self._config.ws_subscribe_max_tokens,
                         max_bytes=self._config.ws_subscribe_max_bytes,
@@ -264,7 +242,7 @@ class LiveDataSource:
 
                         rx_mono_ns = _monotonic_ns()
                         last_rx_mono_ns = rx_mono_ns
-                        if _is_confirm_payload(payload_bytes):
+                        if is_confirm_payload(payload_bytes):
                             confirm_events_seen += 1
                         rx_wall_ns_utc = time.time_ns()
                         frame = RawFrame(
@@ -278,11 +256,13 @@ class LiveDataSource:
                             queue.put_nowait(frame)
                             self._stats.frames += 1
                         except asyncio.QueueFull:
-                            self._stats.dropped += 1
+                            self._stats.dropped.bump()
             except asyncio.CancelledError:
                 raise
             except Exception:
                 if stop_event.is_set():
                     return
                 self._stats.reconnects += 1
-                await asyncio.sleep(self._config.ws_reconnect_backoff_seconds)
+                if not reconnect_policy.can_reconnect(self._stats.reconnects):
+                    return
+                await asyncio.sleep(reconnect_policy.backoff())

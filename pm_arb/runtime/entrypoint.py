@@ -35,6 +35,7 @@ class RunSummary:
     error: str | None = None
     reconnects: int | None = None
     decode_errors: int | None = None
+    dropped: int | None = None
     callback_stats: Mapping[str, dict[str, float | int]] | None = None
     submitted_intents: int | None = None
     pnl_summary: Mapping[str, object] | None = None
@@ -53,6 +54,8 @@ def format_run_summary(summary: RunSummary, *, stable: bool) -> str:
         payload["reconnects"] = summary.reconnects
     if summary.decode_errors is not None:
         payload["decode_errors"] = summary.decode_errors
+    if summary.dropped is not None:
+        payload["dropped"] = summary.dropped
     if summary.callback_stats is not None:
         payload["callback_stats"] = summary.callback_stats
     if summary.submitted_intents is not None:
@@ -94,7 +97,7 @@ def _hash_intent_line(seq: int, intent: Intent) -> bytes:
         tif = intent.tif
         urgency = intent.urgency
         tag = intent.tag or ""
-        strategy_id = intent.tag or ""
+        strategy_id = intent.strategy_id or ""
     elif isinstance(intent, CancelIntent):
         intent_type = "cancel"
         market_id = intent.market_id or ""
@@ -104,7 +107,7 @@ def _hash_intent_line(seq: int, intent: Intent) -> bytes:
         tif = ""
         urgency = ""
         tag = intent.tag or ""
-        strategy_id = intent.tag or ""
+        strategy_id = intent.strategy_id or ""
     else:
         intent_type = "unknown"
         market_id = ""
@@ -292,6 +295,7 @@ async def _run_live_sim_async(
         error=None,
         reconnects=data_source.stats.reconnects,
         decode_errors=normalizer.decode_errors,
+        dropped=data_source.stats.dropped.total,
         callback_stats=_callback_stats_payload(orchestrator.callback_stats()),
         submitted_intents=submitted_intents,
     )
