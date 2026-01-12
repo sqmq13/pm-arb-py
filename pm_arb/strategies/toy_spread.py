@@ -1,0 +1,55 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+from pm_arb.runtime.events import TopOfBookUpdate
+from pm_arb.runtime.intents import Intent, PlaceOrderIntent
+from pm_arb.runtime.state import MarketState
+from pm_arb.runtime.strategy import PortfolioView, StrategyContext
+
+
+@dataclass(slots=True)
+class ToySpreadStrategy:
+    strategy_id: str = "toy_spread"
+    size_e6: int = 1_000_000
+    min_spread_e6: int = 50_000
+
+    def on_top_of_book(
+        self,
+        ctx: StrategyContext,
+        event: TopOfBookUpdate,
+        market_state: MarketState,
+        portfolio: PortfolioView,
+    ) -> list[Intent]:
+        if event.bid_px_e6 is None or event.ask_px_e6 is None:
+            return []
+        if event.ask_px_e6 - event.bid_px_e6 < self.min_spread_e6:
+            return []
+        buy = PlaceOrderIntent(
+            market_id=event.market_id,
+            side="buy",
+            price_e6=event.bid_px_e6,
+            size_e6=self.size_e6,
+            order_type="limit",
+            tif="gtc",
+            urgency="maker",
+            max_slippage_bps=None,
+            tag=self.strategy_id,
+            expires_at=None,
+        )
+        sell = PlaceOrderIntent(
+            market_id=event.market_id,
+            side="sell",
+            price_e6=event.ask_px_e6,
+            size_e6=self.size_e6,
+            order_type="limit",
+            tif="gtc",
+            urgency="maker",
+            max_slippage_bps=None,
+            tag=self.strategy_id,
+            expires_at=None,
+        )
+        return [buy, sell]
+
+    def on_timer(self, ctx: StrategyContext, ts_ns: int) -> list[Intent]:
+        return []

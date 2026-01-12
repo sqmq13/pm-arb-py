@@ -19,7 +19,9 @@ def test_phase1_allowlist() -> None:
         "capture_slice",
         "fees",
         "policy",
+        "runtime",
         "segments",
+        "strategies",
     }
     banned = {
         "book",
