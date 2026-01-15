@@ -1,2 +1,0 @@
-[console_scripts]
-pm_data = pm_data.cli:main
